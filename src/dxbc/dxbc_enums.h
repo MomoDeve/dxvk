@@ -368,6 +368,7 @@ namespace dxvk {
    * Data type for resource read ops.
    */
   enum class DxbcResourceReturnType : uint32_t {
+    None              = 0,
     Unorm             = 1,
     Snorm             = 2,
     Sint              = 3,
@@ -631,5 +632,163 @@ namespace dxvk {
     StaticallyIndexed = 0,
     DynamicallyIndexed = 1,
   };
+
+
+  enum class DxbcShaderVariableFlag : uint32_t {
+    UserPacked         = 0x01,
+    Used               = 0x02,
+    InterfacePointer   = 0x04,
+    InterfaceParameter = 0x08,
+    ForceDword         = 0x7fffffff,
+  };
   
+
+  enum class DxbcShaderCBufferFlag : uint32_t {
+    UserPacked = 0x01,
+    ForceDword = 0x7fffffff
+  };
+
+
+  enum class DxbcCBufferType : uint32_t {
+    CBuffer,
+    TBuffer,
+    InterfacePointers,
+    ResourceBindInfo,
+  };
+
+
+  enum class DxbcShaderVariableClass : uint32_t {
+    Scalar,
+    Vector,
+    MatrixRows,
+    MatrixColumns,
+    Object,
+    Struct,
+    Class,
+    InterfacePointer,
+    ForceDword = 0x7fffffff,
+  };
+
+
+  enum class DxbcShaderVariableType : uint32_t {
+    Void,
+    Bool,
+    Int,
+    Float,
+    String,
+    Texture,
+    Texture1D,
+    Texture2D,
+    Texture3D,
+    TextureCube,
+    Sampler,
+    Sampler1D,
+    Sampler2D,
+    Sampler3D,
+    SamplerCube,
+    PixelShader,
+    VertexShader,
+    PixelFragment,
+    VertexFragment,
+    Uint,
+    Uint8,
+    GeometryShader,
+    Rasterizer,
+    DepthStencil,
+    Blend,
+    Buffer,
+    CBuffer,
+    TBuffer,
+    Texture1DArray,
+    Texture2DArray,
+    RenderTargetView,
+    DepthStencilView,
+    Texture2DMS,
+    Texture2DMSArray,
+    TextureCubeArray,
+    HullShader,
+    DomainShader,
+    InterfacePointer,
+    ComputeShader,
+    Double,
+    RWTexture1D,
+    RWTexture1DArray,
+    RWTexture2D,
+    RWTexture2DArray,
+    RWTexture3D,
+    RWBuffer,
+    ByteAddressBuffer,
+    RWByteAddressBuffer,
+    StructuredBuffer,
+    RWStructuredBuffer,
+    AppendStructuredBuffer,
+    ConsumeStructuredBuffer,
+    ForceDword = 0x7fffffff,
+  };
+
+
+  enum class DxbcShaderRequiresFlag : uint32_t {
+    Doubles                     = 0x00000001,
+    EarlyDepthStencil           = 0x00000002,
+    UavsAtEveryStage            = 0x00000004,
+    Requires64Uavs              = 0x00000008,
+    MinimumPrecision            = 0x00000010,
+    DoubleExtensionsFor11Point1 = 0x00000020,
+    ShaderExtensionsFor11Point1 = 0x00000040,
+    Level9ComparisonFiltering   = 0x00000080,
+  };
+
+
+  enum class DxbcShaderInputType : uint32_t {
+    CBuffer,
+    TBuffer,
+    Texture,
+    Sampler,
+    UavRwTyped,
+    Structured,
+    UavRwStructured,
+    ByteAddress,
+    UavRwByteAddress,
+    UavAppendStructured,
+    UavConsumeStructured,
+    UavRwStructuredWithCounter,
+  };
+
+
+  enum class DxbcShaderInputFlag : uint32_t {
+    None              = 0x0,
+    UserPacked        = 0x1,
+    ComparisonSampler = 0x2,
+    TextureComponent0 = 0x4,
+    TextureComponent1 = 0x8,
+    TextureComponents = 0xc,
+    Unused            = 0x10,
+  };
+
+
+  enum class DxbcShaderFlag : uint32_t {
+    None                         = 0x00000000,
+    Debug                        = 0x00000001,
+    SkipValidation               = 0x00000002,
+    SkipOptimization             = 0x00000004,
+    PackMatrixRowMajor           = 0x00000008,
+    PackMatrixColumnMajor        = 0x00000010,
+    PartialPrecision             = 0x00000020,
+    ForceVsSoftwareNoOpt         = 0x00000040,
+    ForcePsSoftwareNoOpt         = 0x00000080,
+    NoPreshader                  = 0x00000100,
+    AvoidFlowControl             = 0x00000200,
+    PreferFlowControl            = 0x00000400,
+    EnableStrictness             = 0x00000800,
+    EnableBackwardsCompatibility = 0x00001000,
+    IeeeStrictness               = 0x00002000,
+    OptimizationLevel0           = 0x00004000,
+    OptimizationLevel1           = 0x00000000,
+    OptimizationLevel2           = 0x0000C000,
+    OptimizationLevel3           = 0x00008000,
+    Reserved16                   = 0x00010000,
+    Reserved17                   = 0x00020000,
+    WarningsAreErrors            = 0x00040000,
+  };
+
 }

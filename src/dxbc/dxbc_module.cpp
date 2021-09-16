@@ -20,6 +20,8 @@ namespace dxvk {
       chunkReader = chunkReader.clone(8);
       chunkReader = chunkReader.resize(chunkLength);
       
+      if (tag == "RDEF")
+          m_rdefChunk = new DxbcRdef(chunkReader, tag);
       if ((tag == "SHDR") || (tag == "SHEX"))
         m_shexChunk = new DxbcShex(chunkReader);
       

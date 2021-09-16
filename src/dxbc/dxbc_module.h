@@ -4,6 +4,7 @@
 
 #include "dxbc_chunk_isgn.h"
 #include "dxbc_chunk_shex.h"
+#include "dxbc_chunk_rdef.h"
 #include "dxbc_header.h"
 #include "dxbc_modinfo.h"
 #include "dxbc_reader.h"
@@ -82,6 +83,7 @@ namespace dxvk {
     Rc<DxbcIsgn> m_osgnChunk;
     Rc<DxbcIsgn> m_psgnChunk;
     Rc<DxbcShex> m_shexChunk;
+    Rc<DxbcRdef> m_rdefChunk;
     
     void runAnalyzer(
             DxbcAnalyzer&       analyzer,
