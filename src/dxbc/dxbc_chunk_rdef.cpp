@@ -19,6 +19,8 @@ namespace dxvk {
         // from https://github.com/tgjones/slimshader/blob/master/src/SlimShader/Chunks/Rdef/ResourceDefinitionChunk.cs#L50
         if (m_majorVersion >= 5) {
             auto tag = reader.readTag(); // should be RD11
+            if(tag != "RD11")
+                throw DxvkError("DxbcRdef::DxbcRdef: tag must be equal 'RD11' for major version 5 or higher");
 
             uint32_t unknown1 = reader.readu32(); // should be 60
             uint32_t unknown2 = reader.readu32(); // should be 24
@@ -40,15 +42,15 @@ namespace dxvk {
             cbuffer.byteSize = constantBufferReader.readu32();
             cbuffer.flags = (DxbcShaderCBufferFlag)constantBufferReader.readu32();
             cbuffer.type = (DxbcCBufferType)constantBufferReader.readu32();
+            
+            // DxbcReader variableReader = reader.clone(variablesOffset);
+            // for (uint32_t j = 0; j < variablesCount; j++)
+            // {
+            //     DxbcRdefShaderVariable variable = readVariable(reader, variableReader);
+            //     cbuffer.variables.push_back(variable);
+            // }
 
-            DxbcReader variableReader = reader.clone(variablesOffset);
-            for (uint32_t j = 0; j < variablesCount; j++)
-            {
-                DxbcRdefShaderVariable variable = readVariable(reader, variableReader);
-                cbuffer.variables.push_back(variable);
-            }
-
-            m_constantBuffers.push_back(cbuffer);
+             m_constantBuffers.push_back(cbuffer);
         }
 
         DxbcReader resourceBindingReader = reader.clone(resourceBindingOffset);
@@ -66,6 +68,17 @@ namespace dxvk {
 
             m_resourceBindings.push_back(binding);
         }
+    }
+
+    const DxbcRdefResourceBinding& DxbcRdef::getResourceBinding(uint32_t bindPoint, DxbcBindingType type) {
+        for (size_t i = 0; i < m_resourceBindings.size(); i++)
+        {
+            if (m_resourceBindings[i].bindPoint == bindPoint && 
+                compareShaderInputTypeToBindingType(m_resourceBindings[i].shaderInputType, type))
+                return m_resourceBindings[i];
+        }
+        throw DxvkError("DxbcRdef::getResourceBinding: cannot find resource binding");
+        return m_resourceBindings[0];
     }
 
     DxbcRdefShaderVariable DxbcRdef::readVariable(const DxbcReader& reader, DxbcReader& variableReader) {
@@ -117,7 +130,40 @@ namespace dxvk {
         case 0x4353:
             return DxbcProgramType::ComputeShader;
         default:
+            throw DxvkError("DxbcRdef::toDxbcProgramType: unsupported program type");
             return (DxbcProgramType)0;
+        }
+    }
+
+    bool DxbcRdef::compareShaderInputTypeToBindingType(DxbcShaderInputType inputType, DxbcBindingType bindingType) {
+        switch (inputType) {
+        case DxbcShaderInputType::CBuffer:
+            return bindingType == DxbcBindingType::ConstantBuffer;
+        case DxbcShaderInputType::TBuffer:
+            return bindingType == DxbcBindingType::UnorderedAccessView;
+        case DxbcShaderInputType::Texture:
+            return bindingType == DxbcBindingType::ShaderResource;
+        case DxbcShaderInputType::Sampler:
+            return bindingType == DxbcBindingType::ImageSampler;
+        case DxbcShaderInputType::UavRwTyped:
+            return bindingType == DxbcBindingType::UnorderedAccessView;
+        case DxbcShaderInputType::Structured:
+            return bindingType == DxbcBindingType::ShaderResource;
+        case DxbcShaderInputType::UavRwStructured:
+            return bindingType == DxbcBindingType::UnorderedAccessView;
+        case DxbcShaderInputType::ByteAddress:
+            return bindingType == DxbcBindingType::ShaderResource;
+        case DxbcShaderInputType::UavRwByteAddress:
+            return bindingType == DxbcBindingType::UnorderedAccessView;
+        case DxbcShaderInputType::UavAppendStructured:
+            return bindingType == DxbcBindingType::StreamOutputBuffer;
+        case DxbcShaderInputType::UavConsumeStructured:
+            return bindingType == DxbcBindingType::StreamOutputBuffer;
+        case DxbcShaderInputType::UavRwStructuredWithCounter:
+            return bindingType == DxbcBindingType::UavCounter;
+        default:
+            throw DxvkError("DxbcRdef::compareShaderInputTypeToBindingType: unsupported shader input type");
+            return false;
         }
     }
 

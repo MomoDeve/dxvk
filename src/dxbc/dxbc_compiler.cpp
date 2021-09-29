@@ -13,13 +13,14 @@ namespace dxvk {
     const std::string&        fileName,
     const DxbcModuleInfo&     moduleInfo,
     const DxbcProgramInfo&    programInfo,
+    const Rc<DxbcRdef>&       rdef,
     const Rc<DxbcIsgn>&       isgn,
     const Rc<DxbcIsgn>&       osgn,
     const Rc<DxbcIsgn>&       psgn,
     const DxbcAnalysisInfo&   analysis)
   : m_moduleInfo (moduleInfo),
     m_programInfo(programInfo),
-    m_module     (spvVersion(1, 3)),
+    m_rdef       (rdef),
     m_isgn       (isgn),
     m_osgn       (osgn),
     m_psgn       (psgn),
@@ -33,21 +34,6 @@ namespace dxvk {
       spv::SourceLanguageUnknown, 0,
       m_module.addDebugString(fileName.c_str()),
       nullptr);
-
-    if (Logger::logLevel() <= LogLevel::Debug) {
-      if (m_isgn != nullptr) {
-        Logger::debug(str::format("Input Signature for - ", fileName.c_str(), "\n"));
-        m_isgn->printEntries();
-      }
-      if (m_osgn != nullptr) {
-        Logger::debug(str::format("Output Signature for - ", fileName.c_str(), "\n"));
-        m_osgn->printEntries();
-      }
-      if (m_psgn != nullptr) {
-        Logger::debug(str::format("Patch Constant Signature for - ", fileName.c_str(), "\n"));
-        m_psgn->printEntries();
-      }
-    }
     
     // Set the memory model. This is the same for all shaders.
     m_module.setMemoryModel(
@@ -58,6 +44,13 @@ namespace dxvk {
     for (uint32_t i = 0; i < DxbcMaxInterfaceRegs; i++) {
       m_vRegs.at(i) = DxbcRegisterPointer { };
       m_oRegs.at(i) = DxbcRegisterPointer { };
+    }
+    
+    // Clear spec constants
+    for (uint32_t i = 0; i < m_specConstants.size(); i++) {
+      m_specConstants.at(i) = DxbcRegisterValue {
+        DxbcVectorType { DxbcScalarType::Uint32, 0 },
+        0 };
     }
     
     this->emitInit();
@@ -176,9 +169,6 @@ namespace dxvk {
       case DxbcInstClass::VectorImul:
         return this->emitVectorImul(ins);
         
-      case DxbcInstClass::VectorMsad:
-        return this->emitVectorMsad(ins);
-        
       case DxbcInstClass::VectorShift:
         return this->emitVectorShift(ins);
         
@@ -201,7 +191,7 @@ namespace dxvk {
 
     for (auto e = m_isgn->begin(); e != m_isgn->end(); e++) {
       emitDclInput(e->registerId, 1,
-        e->componentMask, DxbcSystemValue::None,
+        e->componentMask, e->systemValue,
         DxbcInterpolationMode::Undefined);
     }
 
@@ -211,7 +201,9 @@ namespace dxvk {
     for (size_t i = 0; i < m_xfbVars.size(); i++)
       streamMask |= 1u << m_xfbVars[i].streamId;
     
-    for (uint32_t streamId : bit::BitMask(streamMask)) {
+    for (uint32_t mask = streamMask; mask != 0; mask &= mask - 1) {
+      const uint32_t streamId = bit::tzcnt(mask);
+
       emitXfbOutputSetup(streamId, true);
       m_module.opEmitVertex(m_module.constu32(streamId));
     }
@@ -233,9 +225,6 @@ namespace dxvk {
       case DxbcProgramType::PixelShader:    this->emitPsFinalize(); break;
       case DxbcProgramType::ComputeShader:  this->emitCsFinalize(); break;
     }
-
-    // Emit float control mode if the extension is supported
-    this->emitFloatControl();
     
     // Declare the entry point, we now have all the
     // information we need, including the interfaces
@@ -358,9 +347,6 @@ namespace dxvk {
   void DxbcCompiler::emitDclGlobalFlags(const DxbcShaderInstruction& ins) {
     const DxbcGlobalFlags flags = ins.controls.globalFlags();
     
-    if (flags.test(DxbcGlobalFlag::RefactoringAllowed))
-      m_precise = false;
-
     if (flags.test(DxbcGlobalFlag::EarlyFragmentTests))
       m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeEarlyFragmentTests);
   }
@@ -369,8 +355,24 @@ namespace dxvk {
   void DxbcCompiler::emitDclTemps(const DxbcShaderInstruction& ins) {
     // dcl_temps has one operand:
     //    (imm0) Number of temp registers
-
-    // Ignore this and declare temps on demand.
+    const uint32_t oldCount = m_rRegs.size();
+    const uint32_t newCount = ins.imm[0].u32;
+    
+    if (newCount > oldCount) {
+      m_rRegs.resize(newCount);
+      
+      DxbcRegisterInfo info;
+      info.type.ctype   = DxbcScalarType::Float32;
+      info.type.ccount  = 4;
+      info.type.alength = 0;
+      info.sclass       = spv::StorageClassPrivate;
+      
+      for (uint32_t i = oldCount; i < newCount; i++) {
+        const uint32_t varId = this->emitNewVariable(info);
+        m_module.setDebugName(varId, str::format("r", i).c_str());
+        m_rRegs.at(i) = varId;
+      }
+    }
   }
   
   
@@ -391,7 +393,6 @@ namespace dxvk {
       m_xRegs.resize(regId + 1);
     
     m_xRegs.at(regId).ccount = info.type.ccount;
-    m_xRegs.at(regId).alength = info.type.alength;
     m_xRegs.at(regId).varId  = emitNewVariable(info);
     
     m_module.setDebugName(m_xRegs.at(regId).varId,
@@ -544,18 +545,6 @@ namespace dxvk {
           "oDepth");
       } break;
       
-      case DxbcOperandType::OutputStencilRef: {
-        m_module.enableExtension("SPV_EXT_shader_stencil_export");
-        m_module.enableCapability(spv::CapabilityStencilExportEXT);
-        m_module.setExecutionMode(m_entryPointId,
-          spv::ExecutionModeStencilRefReplacingEXT);
-        m_ps.builtinStencilRef = emitNewBuiltinVariable({
-          { DxbcScalarType::Sint32, 1, 0 },
-          spv::StorageClassOutput },
-          spv::BuiltInFragStencilRefEXT,
-          "oStencilRef");
-      } break;
-
       case DxbcOperandType::OutputDepthGe: {
         m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDepthReplacing);
         m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDepthGreater);
@@ -680,10 +669,9 @@ namespace dxvk {
         m_module.enableCapability(spv::CapabilitySampleRateShading);
         m_module.decorate(varId, spv::DecorationSample);
       }
-
+      
       // Declare the input slot as defined
       m_interfaceSlots.inputSlots |= 1u << regIdx;
-      m_vArrayLength = std::max(m_vArrayLength, regIdx + 1);
     } else if (sv != DxbcSystemValue::None) {
       // Add a new system value mapping if needed
       bool skipSv = sv == DxbcSystemValue::ClipDistance
@@ -729,12 +717,6 @@ namespace dxvk {
       if (m_moduleInfo.xfb != nullptr)
         info.sclass = spv::StorageClassPrivate;
       
-      // In geometry shaders, don't duplicate system value outputs
-      // to stay within device limits. The pixel shader will read
-      // all GS system value outputs as system value inputs.
-      if (m_programInfo.type() == DxbcProgramType::GeometryShader && sv != DxbcSystemValue::None)
-        info.sclass = spv::StorageClassPrivate;
-
       const uint32_t varId = this->emitNewVariable(info);
       m_module.setDebugName(varId, str::format("o", regIdx).c_str());
       
@@ -745,11 +727,6 @@ namespace dxvk {
         // Add index decoration for potential dual-source blending
         if (m_programInfo.type() == DxbcProgramType::PixelShader)
           m_module.decorateIndex(varId, 0);
-
-        // Declare vertex positions in all stages as invariant, even if
-        // this is not the last stage, to help with potential Z fighting.
-        if (sv == DxbcSystemValue::Position && m_moduleInfo.options.invariantPosition)
-          m_module.decorate(varId, spv::DecorationInvariant);
       }
       
       m_oRegs.at(regIdx) = { regType, varId };
@@ -766,20 +743,17 @@ namespace dxvk {
     //    (1) Number of constants in the buffer
     const uint32_t bufferId     = ins.dst[0].idx[0].offset;
     const uint32_t elementCount = ins.dst[0].idx[1].offset;
-
-    bool asSsbo = m_moduleInfo.options.dynamicIndexedConstantBufferAsSsbo
-      && ins.controls.accessType() == DxbcConstantBufferAccessType::DynamicallyIndexed;
+    const auto& resourceBinding = m_rdef->getResourceBinding(bufferId, DxbcBindingType::ConstantBuffer);
     
     this->emitDclConstantBufferVar(bufferId, elementCount,
-      str::format("cb", bufferId).c_str(), asSsbo);
+        resourceBinding.name.c_str());
   }
   
   
   void DxbcCompiler::emitDclConstantBufferVar(
           uint32_t                regIdx,
           uint32_t                numConstants,
-    const char*                   name,
-          bool                    asSsbo) {
+    const char*                   name) {
     // Uniform buffer data is stored as a fixed-size array
     // of 4x32-bit vectors. SPIR-V requires explicit strides.
     const uint32_t arrayType = m_module.defArrayTypeUnique(
@@ -791,9 +765,7 @@ namespace dxvk {
     // struct and decorate that struct as a block.
     const uint32_t structType = m_module.defStructTypeUnique(1, &arrayType);
     
-    m_module.decorate(structType, asSsbo
-      ? spv::DecorationBufferBlock
-      : spv::DecorationBlock);
+    m_module.decorateBlock       (structType);
     m_module.memberDecorateOffset(structType, 0, 0);
     
     m_module.setDebugName        (structType, str::format(name, "_t").c_str());
@@ -808,15 +780,13 @@ namespace dxvk {
     
     // Compute the DXVK binding slot index for the buffer.
     // D3D11 needs to bind the actual buffers to this slot.
-    uint32_t bindingId = computeConstantBufferBinding(
-      m_programInfo.type(), regIdx);
+    const uint32_t bindingId = computeResourceSlotId(
+      m_programInfo.type(), DxbcBindingType::ConstantBuffer,
+      regIdx);
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
-
-    if (asSsbo)
-      m_module.decorate(varId, spv::DecorationNonWritable);
-
+    
     // Declare a specialization constant which will
     // store whether or not the resource is bound.
     const uint32_t specConstId = m_module.specConstBool(true);
@@ -826,15 +796,14 @@ namespace dxvk {
     
     DxbcConstantBuffer buf;
     buf.varId  = varId;
+    buf.specId = specConstId;
     buf.size   = numConstants;
     m_constantBuffers.at(regIdx) = buf;
     
     // Store descriptor info for the shader interface
     DxvkResourceSlot resource;
     resource.slot = bindingId;
-    resource.type = asSsbo
-      ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-      : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    resource.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     resource.view = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
     resource.access = VK_ACCESS_UNIFORM_READ_BIT;
     m_resourceSlots.push_back(resource);
@@ -851,19 +820,20 @@ namespace dxvk {
     const uint32_t samplerType = m_module.defSamplerType();
     const uint32_t samplerPtrType = m_module.defPointerType(
       samplerType, spv::StorageClassUniformConstant);
+    const auto& resourceBinding = m_rdef->getResourceBinding(samplerId, DxbcBindingType::ImageSampler);
     
     // Define the sampler variable
     const uint32_t varId = m_module.newVar(samplerPtrType,
       spv::StorageClassUniformConstant);
     m_module.setDebugName(varId,
-      str::format("s", samplerId).c_str());
+        resourceBinding.name.c_str());
     
     m_samplers.at(samplerId).varId  = varId;
     m_samplers.at(samplerId).typeId = samplerType;
     
     // Compute binding slot index for the sampler
-    uint32_t bindingId = computeSamplerBinding(
-      m_programInfo.type(), samplerId);
+    const uint32_t bindingId = computeResourceSlotId(
+      m_programInfo.type(), DxbcBindingType::ImageSampler, samplerId);
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
@@ -938,27 +908,13 @@ namespace dxvk {
     
     // Declare additional capabilities if necessary
     switch (resourceType) {
-      case DxbcResourceDim::Buffer:
-        m_module.enableCapability(isUav
-          ? spv::CapabilityImageBuffer
-          : spv::CapabilitySampledBuffer);
-        break;
-      
-      case DxbcResourceDim::Texture1D:
-      case DxbcResourceDim::Texture1DArr:
-        m_module.enableCapability(isUav
-          ? spv::CapabilityImage1D
-          : spv::CapabilitySampled1D);
-        break;
-      
-      case DxbcResourceDim::TextureCubeArr:
-        m_module.enableCapability(
-          spv::CapabilitySampledCubeArray);
-        break;
-      
-      default:
-        // No additional capabilities required
-        break;
+      case DxbcResourceDim::Buffer:         m_module.enableCapability(spv::CapabilityImageBuffer);    break;
+      case DxbcResourceDim::Texture1D:      m_module.enableCapability(spv::CapabilityImage1D);        break;
+      case DxbcResourceDim::Texture1DArr:   m_module.enableCapability(spv::CapabilityImage1D);        break;
+      case DxbcResourceDim::TextureCubeArr: m_module.enableCapability(spv::CapabilityImageCubeArray); break;
+      case DxbcResourceDim::Texture2DMs:    m_module.enableCapability(spv::CapabilityImageMSArray);   break;
+      case DxbcResourceDim::Texture2DMsArr: m_module.enableCapability(spv::CapabilityImageMSArray);   break;
+      default: break; // No additional capabilities required
     }
     
     // If the read-without-format capability is not set and this
@@ -987,15 +943,21 @@ namespace dxvk {
     
     const uint32_t varId = m_module.newVar(resourcePtrType,
       spv::StorageClassUniformConstant);
+
+    const auto& resourceBinding = m_rdef->getResourceBinding(registerId, isUav
+        ? DxbcBindingType::UnorderedAccessView
+        : DxbcBindingType::ShaderResource);
     
     m_module.setDebugName(varId,
-      str::format(isUav ? "u" : "t", registerId).c_str());
+      resourceBinding.name.c_str());
     
     // Compute the DXVK binding slot index for the resource.
     // D3D11 needs to bind the actual resource to this slot.
-    uint32_t bindingId = isUav
-      ? computeUavBinding(m_programInfo.type(), registerId)
-      : computeSrvBinding(m_programInfo.type(), registerId);
+    const uint32_t bindingId = computeResourceSlotId(
+      m_programInfo.type(), isUav
+        ? DxbcBindingType::UnorderedAccessView
+        : DxbcBindingType::ShaderResource,
+      registerId);
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
@@ -1003,12 +965,19 @@ namespace dxvk {
     if (ins.controls.uavFlags().test(DxbcUavFlag::GloballyCoherent))
       m_module.decorate(varId, spv::DecorationCoherent);
     
+    // On GPUs which don't support storageImageReadWithoutFormat,
+    // we have to decorate untyped UAVs as write-only
+    if (isUav && imageFormat == spv::ImageFormatUnknown
+     && !m_moduleInfo.options.useStorageImageReadWithoutFormat)
+      m_module.decorate(varId, spv::DecorationNonReadable);
+   
+
     // Declare a specialization constant which will
     // store whether or not the resource is bound.
     const uint32_t specConstId = m_module.specConstBool(true);
     m_module.decorateSpecId(specConstId, bindingId);
     m_module.setDebugName(specConstId,
-      str::format(isUav ? "u" : "t", registerId, "_bound").c_str());
+        str::format(resourceBinding.name, "_bound").c_str());
     
     if (isUav) {
       DxbcUav uav;
@@ -1021,7 +990,6 @@ namespace dxvk {
       uav.sampledTypeId = sampledTypeId;
       uav.imageTypeId   = imageTypeId;
       uav.structStride  = 0;
-      uav.structAlign   = 0;
       m_uavs.at(registerId) = uav;
     } else {
       DxbcShaderResource res;
@@ -1035,7 +1003,6 @@ namespace dxvk {
       res.colorTypeId   = imageTypeId;
       res.depthTypeId   = 0;
       res.structStride  = 0;
-      res.structAlign   = 0;
       
       if ((sampledType == DxbcScalarType::Float32)
        && (resourceType == DxbcResourceDim::Texture2D
@@ -1054,22 +1021,17 @@ namespace dxvk {
     DxvkResourceSlot resource;
     resource.slot = bindingId;
     resource.view = typeInfo.vtype;
+    resource.access = VK_ACCESS_SHADER_READ_BIT;
     
     if (isUav) {
       resource.type = resourceType == DxbcResourceDim::Buffer
         ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      resource.access = m_analysis->uavInfos[registerId].accessFlags;
-
-      if (!(resource.access & VK_ACCESS_SHADER_WRITE_BIT))
-        m_module.decorate(varId, spv::DecorationNonWritable);
-      if (!(resource.access & VK_ACCESS_SHADER_READ_BIT))
-        m_module.decorate(varId, spv::DecorationNonReadable);
+      resource.access |= VK_ACCESS_SHADER_WRITE_BIT;
     } else {
       resource.type = resourceType == DxbcResourceDim::Buffer
         ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
         : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-      resource.access = VK_ACCESS_SHADER_READ_BIT;
     }
     
     m_resourceSlots.push_back(resource);
@@ -1108,19 +1070,18 @@ namespace dxvk {
       ? ins.imm[0].u32
       : 0;
     
-    uint32_t resAlign = isStructured
-      ? (resStride & -resStride)
-      : 16;
-    
     // Compute the DXVK binding slot index for the resource.
-    uint32_t bindingId = isUav
-      ? computeUavBinding(m_programInfo.type(), registerId)
-      : computeSrvBinding(m_programInfo.type(), registerId);
+    uint32_t bindingId = computeResourceSlotId(
+      m_programInfo.type(), isUav
+        ? DxbcBindingType::UnorderedAccessView
+        : DxbcBindingType::ShaderResource,
+      registerId);
+
+    const auto& resourceBinding = m_rdef->getResourceBinding(registerId, isUav
+        ? DxbcBindingType::UnorderedAccessView
+        : DxbcBindingType::ShaderResource);
     
-    // Test whether we should use a raw SSBO for this resource
-    bool useRawSsbo = m_moduleInfo.options.minSsboAlignment <= resAlign;
-    
-    if (useRawSsbo) {
+    if (m_moduleInfo.options.useRawSsbo) {
       uint32_t elemType   = getScalarTypeId(DxbcScalarType::Uint32);
       uint32_t arrayType  = m_module.defRuntimeArrayTypeUnique(elemType);
       uint32_t structType = m_module.defStructTypeUnique(1, &arrayType);
@@ -1133,15 +1094,17 @@ namespace dxvk {
       m_module.decorate(structType, spv::DecorationBufferBlock);
       m_module.memberDecorateOffset(structType, 0, 0);
 
+
       m_module.setDebugName(structType,
-        str::format(isUav ? "u" : "t", registerId, "_t").c_str());
+          resourceBinding.name.c_str());
       m_module.setDebugMemberName(structType, 0, "m");
+
+      if (!isUav)
+        m_module.decorate(varId, spv::DecorationNonWritable);
     } else {
       // Structured and raw buffers are represented as
       // texel buffers consisting of 32-bit integers.
-      m_module.enableCapability(isUav
-        ? spv::CapabilityImageBuffer
-        : spv::CapabilitySampledBuffer);
+      m_module.enableCapability(spv::CapabilityImageBuffer);
       
       resTypeId = m_module.defImageType(sampledTypeId,
         typeInfo.dim, 0, typeInfo.array, typeInfo.ms, typeInfo.sampled,
@@ -1153,7 +1116,7 @@ namespace dxvk {
     }
 
     m_module.setDebugName(varId,
-      str::format(isUav ? "u" : "t", registerId).c_str());
+        resourceBinding.name.c_str());
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
@@ -1166,7 +1129,7 @@ namespace dxvk {
     const uint32_t specConstId = m_module.specConstBool(true);
     m_module.decorateSpecId(specConstId, bindingId);
     m_module.setDebugName(specConstId,
-      str::format(isUav ? "u" : "t", registerId, "_bound").c_str());
+      str::format(resourceBinding.name, "_bound").c_str());
     
     if (isUav) {
       DxbcUav uav;
@@ -1179,7 +1142,6 @@ namespace dxvk {
       uav.sampledTypeId = sampledTypeId;
       uav.imageTypeId   = resTypeId;
       uav.structStride  = resStride;
-      uav.structAlign   = resAlign;
       m_uavs.at(registerId) = uav;
     } else {
       DxbcShaderResource res;
@@ -1193,29 +1155,22 @@ namespace dxvk {
       res.colorTypeId   = resTypeId;
       res.depthTypeId   = 0;
       res.structStride  = resStride;
-      res.structAlign   = resAlign;
       m_textures.at(registerId) = res;
     }
     
     // Store descriptor info for the shader interface
     DxvkResourceSlot resource;
     resource.slot = bindingId;
-    resource.type = useRawSsbo
+    resource.type = m_moduleInfo.options.useRawSsbo
       ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
       : (isUav
         ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
         : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
     resource.view = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    resource.access = isUav
-      ? m_analysis->uavInfos[registerId].accessFlags
-      : VK_ACCESS_SHADER_READ_BIT;
+    resource.access = VK_ACCESS_SHADER_READ_BIT;
 
-    if (useRawSsbo || isUav) {
-      if (!(resource.access & VK_ACCESS_SHADER_WRITE_BIT))
-        m_module.decorate(varId, spv::DecorationNonWritable);
-      if (!(resource.access & VK_ACCESS_SHADER_READ_BIT))
-        m_module.decorate(varId, spv::DecorationNonReadable);
-    }
+    if (isUav)
+      resource.access |= VK_ACCESS_SHADER_WRITE_BIT;
 
     m_resourceSlots.push_back(resource);
   }
@@ -1414,7 +1369,6 @@ namespace dxvk {
     // dcl_gs_instance_count has one operand:
     //    (imm0) Number of geometry shader invocations
     m_module.setInvocations(m_entryPointId, ins.imm[0].u32);
-    m_gs.invocationCount = ins.imm[0].u32;
   }
   
   
@@ -1442,8 +1396,9 @@ namespace dxvk {
     m_module.setDebugName(varId,
       str::format("u", regId, "_meta").c_str());
     
-    uint32_t bindingId = computeUavCounterBinding(
-      m_programInfo.type(), regId);
+    const uint32_t bindingId = computeResourceSlotId(
+      m_programInfo.type(), DxbcBindingType::UavCounter,
+      regId);
     
     m_module.decorateDescriptorSet(varId, 0);
     m_module.decorateBinding(varId, bindingId);
@@ -1528,8 +1483,7 @@ namespace dxvk {
   void DxbcCompiler::emitDclImmediateConstantBufferUbo(
           uint32_t                dwordCount,
     const uint32_t*               dwordArray) {
-    this->emitDclConstantBufferVar(Icb_BindingSlotId, dwordCount / 4, "icb",
-      m_moduleInfo.options.dynamicIndexedConstantBufferAsSsbo);
+    this->emitDclConstantBufferVar(Icb_BindingSlotId, dwordCount / 4, "icb");
     m_immConstData = DxvkShaderConstData(dwordCount, dwordArray);
   }
 
@@ -1771,7 +1725,7 @@ namespace dxvk {
         return;
     }
     
-    if (ins.controls.precise() || m_precise)
+    if (ins.controls.precise())
       m_module.decorate(dst.id, spv::DecorationNoContraction);
     
     // Store computed value
@@ -1866,14 +1820,7 @@ namespace dxvk {
     if (componentCount > 1)
       conditionType = m_module.defVectorType(conditionType, componentCount);
     
-    bool invert = false;
-
     switch (ins.op) {
-      case DxbcOpcode::Ne:
-      case DxbcOpcode::DNe:
-        invert = true;
-        /* fall through */
-
       case DxbcOpcode::Eq:
       case DxbcOpcode::DEq:
         condition = m_module.opFOrdEqual(
@@ -1889,6 +1836,12 @@ namespace dxvk {
       case DxbcOpcode::Lt:
       case DxbcOpcode::DLt:
         condition = m_module.opFOrdLessThan(
+          conditionType, src.at(0).id, src.at(1).id);
+        break;
+      
+      case DxbcOpcode::Ne:
+      case DxbcOpcode::DNe:
+        condition = m_module.opFOrdNotEqual(
           conditionType, src.at(0).id, src.at(1).id);
         break;
       
@@ -1947,9 +1900,6 @@ namespace dxvk {
       sTrue  = m_module.constComposite(typeId, componentCount, vTrue .data());
     }
     
-    if (invert)
-      std::swap(sFalse, sTrue);
-
     // Perform component-wise mask selection
     // based on the condition evaluated above.
     result.id = m_module.opSelect(
@@ -2023,7 +1973,7 @@ namespace dxvk {
       src.at(0).id,
       src.at(1).id);
     
-    if (ins.controls.precise() || m_precise)
+    if (ins.controls.precise())
       m_module.decorate(dst.id, spv::DecorationNoContraction);
     
     dst = emitDstOperandModifiers(dst, ins.modifiers);
@@ -2061,14 +2011,6 @@ namespace dxvk {
       emitRegisterLoad(ins.src[1], srcMask),
     };
     
-    // Division by zero will return 0xffffffff for both results
-    auto bvecId = getVectorTypeId({ DxbcScalarType::Bool, srcMask.popCount() });
-
-    DxbcRegisterValue const0  = emitBuildConstVecu32( 0u,  0u,  0u,  0u, srcMask);
-    DxbcRegisterValue constff = emitBuildConstVecu32(~0u, ~0u, ~0u, ~0u, srcMask);
-
-    uint32_t cmpValue = m_module.opINotEqual(bvecId, src.at(1).id, const0.id);
-
     // Compute results only if the destination
     // operands are not NULL.
     if (ins.dst[0].type != DxbcOperandType::Null) {
@@ -2079,10 +2021,6 @@ namespace dxvk {
       quotient.id = m_module.opUDiv(
         getVectorTypeId(quotient.type),
         src.at(0).id, src.at(1).id);
-
-      quotient.id = m_module.opSelect(
-        getVectorTypeId(quotient.type),
-        cmpValue, quotient.id, constff.id);
       
       quotient = emitDstOperandModifiers(quotient, ins.modifiers);
       emitRegisterStore(ins.dst[0], quotient);
@@ -2096,10 +2034,6 @@ namespace dxvk {
       remainder.id = m_module.opUMod(
         getVectorTypeId(remainder.type),
         src.at(0).id, src.at(1).id);
-
-      remainder.id = m_module.opSelect(
-        getVectorTypeId(remainder.type),
-        cmpValue, remainder.id, constff.id);
       
       remainder = emitDstOperandModifiers(remainder, ins.modifiers);
       emitRegisterStore(ins.dst[1], remainder);
@@ -2140,38 +2074,6 @@ namespace dxvk {
   }
   
   
-  void DxbcCompiler::emitVectorMsad(const DxbcShaderInstruction& ins) {
-    // msad has four operands:
-    //    (dst0) Destination
-    //    (src0) Reference (packed uint8)
-    //    (src1) Source (packed uint8)
-    //    (src2) Accumulator
-    DxbcRegisterValue refReg = emitRegisterLoad(ins.src[0], ins.dst[0].mask);
-    DxbcRegisterValue srcReg = emitRegisterLoad(ins.src[1], ins.dst[0].mask);
-    DxbcRegisterValue result = emitRegisterLoad(ins.src[2], ins.dst[0].mask);
-    
-    auto typeId = getVectorTypeId(result.type);
-    auto bvecId = getVectorTypeId({ DxbcScalarType::Bool, result.type.ccount });
-
-    for (uint32_t i = 0; i < 4; i++) {
-      auto shift = m_module.constu32(8 * i);
-      auto count = m_module.constu32(8);
-
-      auto ref = m_module.opBitFieldUExtract(typeId, refReg.id, shift, count);
-      auto src = m_module.opBitFieldUExtract(typeId, srcReg.id, shift, count);
-
-      auto zero = emitBuildConstVecu32(0, 0, 0, 0, ins.dst[0].mask);
-      auto mask = m_module.opINotEqual(bvecId, ref, zero.id);
-
-      auto diff = m_module.opSAbs(typeId, m_module.opISub(typeId, ref, src));
-      result.id = m_module.opSelect(typeId, mask, m_module.opIAdd(typeId, result.id, diff), result.id);
-    }
-
-    result = emitDstOperandModifiers(result, ins.modifiers);
-    emitRegisterStore(ins.dst[0], result);
-  }
-
-
   void DxbcCompiler::emitVectorShift(const DxbcShaderInstruction& ins) {
     // Shift operations have three operands:
     //    (dst0) The destination register
@@ -2277,8 +2179,7 @@ namespace dxvk {
     bool doCut = ins.op != DxbcOpcode::Emit && ins.op != DxbcOpcode::EmitStream;
 
     if (doEmit) {
-      if (m_perVertexOut)
-        emitOutputSetup();
+      emitOutputSetup();
       emitClipCullStore(DxbcSystemValue::ClipDistance, m_clipDistances);
       emitClipCullStore(DxbcSystemValue::CullDistance, m_cullDistances);
       emitXfbOutputSetup(streamId, false);
@@ -2302,13 +2203,9 @@ namespace dxvk {
     //    (srcX) As above
     const DxbcBufferInfo bufferInfo = getBufferInfo(ins.dst[ins.dstCount - 1]);
     
-    bool isImm = ins.dstCount == 2;
-    bool isUav = ins.dst[ins.dstCount - 1].type == DxbcOperandType::UnorderedAccessView;
+    const bool isImm = ins.dstCount == 2;
+    const bool isUav = ins.dst[ins.dstCount - 1].type == DxbcOperandType::UnorderedAccessView;
     
-    bool isSsbo = m_moduleInfo.options.minSsboAlignment <= bufferInfo.align
-               && bufferInfo.type != DxbcResourceType::Typed
-               && isUav;
-
     // Perform atomic operations on UAVs only if the UAV
     // is bound and if there is nothing else stopping us.
     DxbcConditional cond;
@@ -2344,11 +2241,8 @@ namespace dxvk {
     
     if (isUav) {
       scope     = spv::ScopeDevice;
-      semantics = spv::MemorySemanticsAcquireReleaseMask;
-
-      semantics |= isSsbo
-                ? spv::MemorySemanticsUniformMemoryMask
-                : spv::MemorySemanticsImageMemoryMask;
+      semantics = spv::MemorySemanticsImageMemoryMask
+                | spv::MemorySemanticsAcquireReleaseMask;
     } else {
       scope     = spv::ScopeWorkgroup;
       semantics = spv::MemorySemanticsWorkgroupMemoryMask
@@ -2479,56 +2373,7 @@ namespace dxvk {
     m_module.opBranchConditional(writeTest, cond.labelIf, cond.labelEnd);
     
     m_module.opLabel(cond.labelIf);
-
-    // Only use subgroup ops on compute to avoid having to
-    // deal with helper invocations or hardware limitations
-    bool useSubgroupOps = m_moduleInfo.options.useSubgroupOpsForAtomicCounters
-      && m_programInfo.type() == DxbcProgramType::ComputeShader;
-
-    // In case we have subgroup ops enabled, we need to
-    // count the number of active lanes, the lane index,
-    // and we need to perform the atomic op conditionally
-    uint32_t laneCount = 0;
-    uint32_t laneIndex = 0;
-
-    DxbcConditional elect;
-
-    if (useSubgroupOps) {
-      m_module.enableCapability(spv::CapabilityGroupNonUniform);
-      m_module.enableCapability(spv::CapabilityGroupNonUniformBallot);
-
-      uint32_t ballot = m_module.opGroupNonUniformBallot(
-        getVectorTypeId({ DxbcScalarType::Uint32, 4 }),
-        m_module.constu32(spv::ScopeSubgroup),
-        m_module.constBool(true));
-      
-      laneCount = m_module.opGroupNonUniformBallotBitCount(
-        getScalarTypeId(DxbcScalarType::Uint32),
-        m_module.constu32(spv::ScopeSubgroup),
-        spv::GroupOperationReduce, ballot);
-      
-      laneIndex = m_module.opGroupNonUniformBallotBitCount(
-        getScalarTypeId(DxbcScalarType::Uint32),
-        m_module.constu32(spv::ScopeSubgroup),
-        spv::GroupOperationExclusiveScan, ballot);
-      
-      // Elect one lane to perform the atomic op
-      uint32_t election = m_module.opGroupNonUniformElect(
-        m_module.defBoolType(),
-        m_module.constu32(spv::ScopeSubgroup));
-
-      elect.labelIf  = m_module.allocateId();
-      elect.labelEnd = m_module.allocateId();
-
-      m_module.opSelectionMerge(elect.labelEnd, spv::SelectionControlMaskNone);
-      m_module.opBranchConditional(election, elect.labelIf, elect.labelEnd);
-      
-      m_module.opLabel(elect.labelIf);
-    } else {
-      // We're going to use this for the increment
-      laneCount = m_module.constu32(1);
-    }
-
+    
     // Get a pointer to the atomic counter in question
     DxbcRegisterInfo ptrType;
     ptrType.type.ctype   = DxbcScalarType::Uint32;
@@ -2536,8 +2381,8 @@ namespace dxvk {
     ptrType.type.alength = 0;
     ptrType.sclass = spv::StorageClassUniform;
     
-    uint32_t zeroId = m_module.consti32(0);
-    uint32_t ptrId  = m_module.opAccessChain(
+    const uint32_t zeroId = m_module.consti32(0);
+    const uint32_t ptrId  = m_module.opAccessChain(
       getPointerTypeId(ptrType),
       m_uavs.at(registerId).ctrId,
       1, &zeroId);
@@ -2547,26 +2392,27 @@ namespace dxvk {
     uint32_t semantics = spv::MemorySemanticsUniformMemoryMask
                        | spv::MemorySemanticsAcquireReleaseMask;
     
-    uint32_t scopeId     = m_module.constu32(scope);
-    uint32_t semanticsId = m_module.constu32(semantics);
+    const uint32_t scopeId     = m_module.constu32(scope);
+    const uint32_t semanticsId = m_module.constu32(semantics);
     
     // Compute the result value
     DxbcRegisterValue value;
     value.type.ctype  = DxbcScalarType::Uint32;
     value.type.ccount = 1;
     
-    uint32_t typeId = getVectorTypeId(value.type);
+    const uint32_t typeId = getVectorTypeId(value.type);
     
     switch (ins.op) {
       case DxbcOpcode::ImmAtomicAlloc:
         value.id = m_module.opAtomicIAdd(typeId, ptrId,
-          scopeId, semanticsId, laneCount);
+          scopeId, semanticsId, m_module.constu32(1));
         break;
         
       case DxbcOpcode::ImmAtomicConsume:
         value.id = m_module.opAtomicISub(typeId, ptrId,
-          scopeId, semanticsId, laneCount);
-        value.id = m_module.opISub(typeId, value.id, laneCount);
+          scopeId, semanticsId, m_module.constu32(1));
+        value.id = m_module.opISub(typeId, value.id,
+          m_module.constu32(1));
         break;
       
       default:
@@ -2574,26 +2420,6 @@ namespace dxvk {
           "DxbcCompiler: Unhandled instruction: ",
           ins.op));
         return;
-    }
-
-    // If we're using subgroup ops, we have to broadcast
-    // the result of the atomic op and compute the index
-    if (useSubgroupOps) {
-      m_module.opBranch(elect.labelEnd);
-      m_module.opLabel (elect.labelEnd);
-
-      uint32_t undef = m_module.constUndef(typeId);
-
-      std::array<SpirvPhiLabel, 2> phiLabels = {{
-        { value.id, elect.labelIf },
-        { undef,    cond.labelIf  },
-      }};
-
-      value.id = m_module.opPhi(typeId,
-        phiLabels.size(), phiLabels.data());
-      value.id = m_module.opGroupNonUniformBroadcastFirst(typeId,
-        m_module.constu32(spv::ScopeSubgroup), value.id);
-      value.id = m_module.opIAdd(typeId, value.id, laneIndex);
     }
     
     // Store the result
@@ -2764,19 +2590,13 @@ namespace dxvk {
     
     // The 'Hi' variants are counted from the MSB in DXBC
     // rather than the LSB, so we have to invert the number
-    if (ins.op == DxbcOpcode::FirstBitHi || ins.op == DxbcOpcode::FirstBitShi) {
-      uint32_t boolTypeId = m_module.defBoolType();
-
-      if (dst.type.ccount > 1)
-        boolTypeId = m_module.defVectorType(boolTypeId, dst.type.ccount);
-
-      DxbcRegisterValue const31 = emitBuildConstVecu32(31u, 31u, 31u, 31u, ins.dst[0].mask);
-      DxbcRegisterValue constff = emitBuildConstVecu32(~0u, ~0u, ~0u, ~0u, ins.dst[0].mask);
-
+    if (ins.op == DxbcOpcode::FirstBitHi
+     || ins.op == DxbcOpcode::FirstBitShi) {
       dst.id = m_module.opSelect(typeId,
-        m_module.opINotEqual(boolTypeId, dst.id, constff.id),
-        m_module.opISub(typeId, const31.id, dst.id),
-        constff.id);
+        m_module.opINotEqual(m_module.defBoolType(),
+          dst.id, m_module.constu32(0xFFFFFFFF)),
+        m_module.opISub(typeId, m_module.constu32(31), dst.id),
+        m_module.constu32(0xFFFFFFFF));
     }
     
     // No modifiers are supported
@@ -2788,10 +2608,11 @@ namespace dxvk {
     // bufinfo takes two arguments
     //    (dst0) The destination register
     //    (src0) The buffer register to query
+    // TODO Check if resource is bound
     const DxbcBufferInfo bufferInfo = getBufferInfo(ins.src[0]);
 
-    bool isSsbo = m_moduleInfo.options.minSsboAlignment <= bufferInfo.align
-               && bufferInfo.type != DxbcResourceType::Typed;
+    bool isSsbo = m_moduleInfo.options.useRawSsbo
+      && bufferInfo.type != DxbcResourceType::Typed;
     
     // We'll store this as a scalar unsigned integer
     DxbcRegisterValue result = isSsbo
@@ -2810,7 +2631,7 @@ namespace dxvk {
       result.id = m_module.opUDiv(typeId, result.id,
         m_module.constu32(bufferInfo.stride / 4));
     }
-
+    
     // Store the result. The scalar will be extended to a
     // vector if the write mask consists of more than one
     // component, which is the desired behaviour.
@@ -2828,6 +2649,7 @@ namespace dxvk {
     //    (src0) Structure index
     //    (src1) Byte offset
     //    (src2) Source register
+    // TODO Check if resource is bound
     const bool isStructured = ins.op == DxbcOpcode::LdStructured;
     
     // Source register. The exact way we access
@@ -2862,6 +2684,7 @@ namespace dxvk {
     //    (src0) Structure index
     //    (src1) Byte offset
     //    (src2) Source register
+    // TODO Check if resource is bound
     const bool isStructured = ins.op == DxbcOpcode::StoreStructured;
     
     // Source register. The exact way we access
@@ -2930,37 +2753,16 @@ namespace dxvk {
           1, &zeroIndex);
       }
     }
-
+    
+    // Store result in the destination register
     DxbcRegisterValue result;
     result.type.ctype  = ins.dst[0].dataType;
     result.type.ccount = componentCount;
-
-    uint32_t typeId = getVectorTypeId(result.type);
     result.id = componentCount > 1
-      ? m_module.opCompositeConstruct(typeId,
+      ? m_module.opCompositeConstruct(
+          getVectorTypeId(result.type),
           componentCount, scalarIds.data())
       : scalarIds[0];
-
-    if (isPack) {
-      // Some drivers return infinity if the input value is above a certain
-      // threshold, but D3D wants us to return infinity only if the input is
-      // actually infinite. Fix this up to return the maximum representable
-      // 16-bit floating point number instead, but preserve input infinity.
-      uint32_t t_bvec = getVectorTypeId({ DxbcScalarType::Bool, componentCount });
-      uint32_t f16Infinity = m_module.constuReplicant(0x7C00, componentCount);
-      uint32_t f16Unsigned = m_module.constuReplicant(0x7FFF, componentCount);
-
-      uint32_t isInputInf = m_module.opIsInf(t_bvec, src.id);
-      uint32_t isValueInf = m_module.opIEqual(t_bvec, f16Infinity,
-        m_module.opBitwiseAnd(typeId, result.id, f16Unsigned));
-
-      result.id = m_module.opSelect(getVectorTypeId(result.type),
-        m_module.opLogicalAnd(t_bvec, isValueInf, m_module.opLogicalNot(t_bvec, isInputInf)),
-        m_module.opISub(typeId, result.id, m_module.constuReplicant(1, componentCount)),
-        result.id);
-    }
-
-    // Store result in the destination register
     emitRegisterStore(ins.dst[0], result);
   }
 
@@ -3126,6 +2928,7 @@ namespace dxvk {
     //    (dst0) The destination register
     //    (src0) Resource LOD to query
     //    (src1) Resource to query
+    // TODO Check if resource is bound
     const DxbcBufferInfo resourceInfo = getBufferInfo(ins.src[1]);
     const DxbcResinfoType resinfoType = ins.controls.resinfoType();
     
@@ -3223,16 +3026,18 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
+    const uint32_t textureId = textureReg.idx[0].offset;
+    const uint32_t samplerId = samplerReg.idx[0].offset;
     
     // Load texture coordinates
     const DxbcRegisterValue coord = emitRegisterLoad(texCoordReg,
-      DxbcRegMask::firstN(getTexLayerDim(texture.imageInfo)));
+      DxbcRegMask::firstN(getTexLayerDim(m_textures.at(textureId).imageInfo)));
     
     // Query the LOD. The result is a two-dimensional float32
     // vector containing the mip level and virtual LOD numbers.
-    const uint32_t sampledImageId = emitLoadSampledImage(texture, sampler, false);
+    const uint32_t sampledImageId = emitLoadSampledImage(
+      m_textures.at(textureId), m_samplers.at(samplerId), false);
+    
     const uint32_t queriedLodId = m_module.opImageQueryLod(
       getVectorTypeId({ DxbcScalarType::Float32, 2 }),
       sampledImageId, coord.id);
@@ -3249,7 +3054,6 @@ namespace dxvk {
       getVectorTypeId(result.type),
       resultIds.size(), resultIds.data());
     
-    result = emitRegisterSwizzle(result, ins.src[1].swizzle, ins.dst[0].mask);
     emitRegisterStore(ins.dst[0], result);
   }
   
@@ -3258,6 +3062,7 @@ namespace dxvk {
     // sampleinfo has two operands:
     //    (dst0) The destination register
     //    (src0) Resource to query
+    // TODO Check if resource is bound
     DxbcRegisterValue sampleCount = emitQueryTextureSamples(ins.src[0]);
     
     if (ins.controls.returnType() != DxbcInstructionReturnType::Uint) {
@@ -3276,6 +3081,7 @@ namespace dxvk {
     //    (dst0) The destination register
     //    (src0) Resource to query 
     //    (src1) Sample index
+    // TODO Check if resource is bound
     if (m_samplePositions == 0)
       m_samplePositions = emitSamplePosArray();
     
@@ -3315,25 +3121,16 @@ namespace dxvk {
     // components to the destination register.
     DxbcRegisterPointer samplePos;
     samplePos.type.ctype  = DxbcScalarType::Float32;
-    samplePos.type.ccount = 2;
+    samplePos.type.ccount = 4;
     samplePos.id = m_module.opAccessChain(
       m_module.defPointerType(
         getVectorTypeId(samplePos.type),
         spv::StorageClassPrivate),
       m_samplePositions, 1, &lookupIndex);
     
-    // Expand to vec4 by appending zeroes
-    DxbcRegisterValue result = emitValueLoad(samplePos);
-
-    DxbcRegisterValue zero;
-    zero.type.ctype  = DxbcScalarType::Float32;
-    zero.type.ccount = 2;
-    zero.id = m_module.constvec2f32(0.0f, 0.0f);
-
-    result = emitRegisterConcat(result, zero);
-    
     emitRegisterStore(ins.dst[0],
-      emitRegisterSwizzle(result,
+      emitRegisterSwizzle(
+        emitValueLoad(samplePos),
         ins.src[0].swizzle,
         ins.dst[0].mask));
   }
@@ -3349,8 +3146,11 @@ namespace dxvk {
     //    (src0) Source address
     //    (src1) Source texture
     //    (src2) Sample number
-    const auto& texture = m_textures.at(ins.src[1].idx[0].offset);
-    const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
+    const uint32_t textureId = ins.src[1].idx[0].offset;
+    
+    // Image type, which stores the image dimensions etc.
+    const DxbcImageInfo imageType = m_textures.at(textureId).imageInfo;
+    const uint32_t imageLayerDim  = getTexLayerDim(imageType);
     
     // Load the texture coordinates. The last component
     // contains the LOD if the resource is an image.
@@ -3376,17 +3176,9 @@ namespace dxvk {
     
     // The LOD is not present when reading from
     // a buffer or from a multisample texture.
-    if (texture.imageInfo.dim != spv::DimBuffer && texture.imageInfo.ms == 0) {
-      DxbcRegisterValue imageLod;
-      
-      if (ins.op != DxbcOpcode::LdMs) {
-        imageLod = emitRegisterExtract(
-          address, DxbcRegMask(false, false, false, true));
-      } else {
-        // If we force-disabled MSAA, fetch from LOD 0
-        imageLod.type = { DxbcScalarType::Uint32, 1 };
-        imageLod.id = m_module.constu32(0);
-      }
+    if (imageType.dim != spv::DimBuffer && imageType.ms == 0) {
+      DxbcRegisterValue imageLod = emitRegisterExtract(
+        address, DxbcRegMask(false, false, false, true));
       
       imageOperands.flags |= spv::ImageOperandsLodMask;
       imageOperands.sLod = imageLod.id;
@@ -3394,7 +3186,7 @@ namespace dxvk {
     
     // The ld2ms instruction has a sample index, but we
     // are only allowed to set it for multisample views
-    if (ins.op == DxbcOpcode::LdMs && texture.imageInfo.ms == 1) {
+    if (ins.op == DxbcOpcode::LdMs && imageType.ms == 1) {
       DxbcRegisterValue sampleId = emitRegisterLoad(
         ins.src[2], DxbcRegMask(true, false, false, false));
       
@@ -3403,14 +3195,25 @@ namespace dxvk {
     }
     
     // Extract coordinates from address
-    const DxbcRegisterValue coord = emitCalcTexCoord(address, texture.imageInfo);
+    const DxbcRegisterValue coord = emitCalcTexCoord(address, imageType);
+    
+    // Fetch texels only if the resource is actually bound
+    const uint32_t labelMerge     = m_module.allocateId();
+    const uint32_t labelBound     = m_module.allocateId();
+    const uint32_t labelUnbound   = m_module.allocateId();
+    
+    m_module.opSelectionMerge(labelMerge, spv::SelectionControlMaskNone);
+    m_module.opBranchConditional(m_textures.at(textureId).specId, labelBound, labelUnbound);
+    m_module.opLabel(labelBound);
     
     // Reading a typed image or buffer view
     // always returns a four-component vector.
-    const uint32_t imageId = m_module.opLoad(texture.imageTypeId, texture.varId);
+    const uint32_t imageId = m_module.opLoad(
+      m_textures.at(textureId).imageTypeId,
+      m_textures.at(textureId).varId);
     
     DxbcRegisterValue result;
-    result.type.ctype  = texture.sampledType;
+    result.type.ctype  = m_textures.at(textureId).sampledType;
     result.type.ccount = 4;
     result.id = m_module.opImageFetch(
       getVectorTypeId(result.type), imageId,
@@ -3422,15 +3225,32 @@ namespace dxvk {
       ins.src[1].swizzle, ins.dst[0].mask);
     
     // If the texture is not bound, return zeroes
-    DxbcRegisterValue bound;
-    bound.type = { DxbcScalarType::Bool, 1 };
-    bound.id = texture.specId;
+    m_module.opBranch(labelMerge);
+    m_module.opLabel(labelUnbound);
+    
+    DxbcRegisterValue zeroes = [&] {
+      switch (result.type.ctype) {
+        case DxbcScalarType::Float32: return emitBuildConstVecf32(0.0f, 0.0f, 0.0f, 0.0f, ins.dst[0].mask);
+        case DxbcScalarType::Uint32:  return emitBuildConstVecu32(0u, 0u, 0u, 0u,         ins.dst[0].mask);
+        case DxbcScalarType::Sint32:  return emitBuildConstVeci32(0, 0, 0, 0,             ins.dst[0].mask);
+        default: throw DxvkError("DxbcCompiler: Invalid scalar type");
+      }
+    }();
+    
+    m_module.opBranch(labelMerge);
+    m_module.opLabel(labelMerge);
+    
+    // Merge the result with a phi function
+    const std::array<SpirvPhiLabel, 2> phiLabels = {{
+      { result.id, labelBound   },
+      { zeroes.id, labelUnbound },
+    }};
     
     DxbcRegisterValue mergedResult;
     mergedResult.type = result.type;
-    mergedResult.id = m_module.opSelect(getVectorTypeId(mergedResult.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
+    mergedResult.id = m_module.opPhi(
+      getVectorTypeId(mergedResult.type),
+      phiLabels.size(), phiLabels.data());
     
     emitRegisterStore(ins.dst[0], mergedResult);
   }
@@ -3456,15 +3276,16 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2 + isExtendedGather];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
+    const uint32_t textureId = textureReg.idx[0].offset;
+    const uint32_t samplerId = samplerReg.idx[0].offset;
     
     // Image type, which stores the image dimensions etc.
-    const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
+    const DxbcImageInfo imageType = m_textures.at(textureId).imageInfo;
+    const uint32_t imageLayerDim = getTexLayerDim(imageType);
     
     // Load the texture coordinates. SPIR-V allows these
     // to be float4 even if not all components are used.
-    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, imageType);
     
     // Load reference value for depth-compare operations
     const bool isDepthCompare = ins.op == DxbcOpcode::Gather4C
@@ -3474,6 +3295,11 @@ namespace dxvk {
       ? emitRegisterLoad(ins.src[3 + isExtendedGather],
           DxbcRegMask(true, false, false, false))
       : DxbcRegisterValue();
+    
+    // Determine the sampled image type based on the opcode.
+    const uint32_t sampledImageType = isDepthCompare
+      ? m_module.defSampledImageType(m_textures.at(textureId).depthTypeId)
+      : m_module.defSampledImageType(m_textures.at(textureId).colorTypeId);
     
     // Accumulate additional image operands.
     SpirvImageOperands imageOperands;
@@ -3499,12 +3325,20 @@ namespace dxvk {
         imageLayerDim, offsetIds.data());
     }
     
+    // Combine the texture and the sampler into a sampled image
+    const uint32_t sampledImageId = m_module.opSampledImage(
+      sampledImageType,
+      m_module.opLoad(
+        m_textures.at(textureId).imageTypeId,
+        m_textures.at(textureId).varId),
+      m_module.opLoad(
+        m_samplers.at(samplerId).typeId,
+        m_samplers.at(samplerId).varId));
+    
     // Gathering texels always returns a four-component
     // vector, even for the depth-compare variants.
-    uint32_t sampledImageId = emitLoadSampledImage(texture, sampler, isDepthCompare);
-
     DxbcRegisterValue result;
-    result.type.ctype  = texture.sampledType;
+    result.type.ctype  = m_textures.at(textureId).sampledType;
     result.type.ccount = 4;
     
     switch (ins.op) {
@@ -3537,14 +3371,6 @@ namespace dxvk {
     result = emitRegisterSwizzle(result,
       textureReg.swizzle, ins.dst[0].mask);
     
-    DxbcRegisterValue bound;
-    bound.type = { DxbcScalarType::Bool, 1 };
-    bound.id = texture.specId;
-    
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
-
     emitRegisterStore(ins.dst[0], result);
   }
   
@@ -3560,13 +3386,16 @@ namespace dxvk {
     const DxbcRegister& samplerReg  = ins.src[2];
     
     // Texture and sampler register IDs
-    const auto& texture = m_textures.at(textureReg.idx[0].offset);
-    const auto& sampler = m_samplers.at(samplerReg.idx[0].offset);
-    const uint32_t imageLayerDim = getTexLayerDim(texture.imageInfo);
+    const uint32_t textureId = textureReg.idx[0].offset;
+    const uint32_t samplerId = samplerReg.idx[0].offset;
+    
+    // Image type, which stores the image dimensions etc.
+    const DxbcImageInfo imageType = m_textures.at(textureId).imageInfo;
+    const uint32_t imageLayerDim  = getTexLayerDim(imageType);
     
     // Load the texture coordinates. SPIR-V allows these
     // to be float4 even if not all components are used.
-    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, texture.imageInfo);
+    DxbcRegisterValue coord = emitLoadTexCoord(texCoordReg, imageType);
     
     // Load reference value for depth-compare operations
     const bool isDepthCompare = ins.op == DxbcOpcode::SampleC
@@ -3613,12 +3442,14 @@ namespace dxvk {
     }
     
     // Combine the texture and the sampler into a sampled image
-    uint32_t sampledImageId = emitLoadSampledImage(texture, sampler, isDepthCompare);
+    const uint32_t sampledImageId = emitLoadSampledImage(
+      m_textures.at(textureId), m_samplers.at(samplerId),
+      isDepthCompare);
     
     // Sampling an image always returns a four-component
     // vector, whereas depth-compare ops return a scalar.
     DxbcRegisterValue result;
-    result.type.ctype  = texture.sampledType;
+    result.type.ctype  = m_textures.at(textureId).sampledType;
     result.type.ccount = isDepthCompare ? 1 : 4;
     
     switch (ins.op) {
@@ -3692,14 +3523,6 @@ namespace dxvk {
         textureReg.swizzle, ins.dst[0].mask);
     }
     
-    DxbcRegisterValue bound;
-    bound.type = { DxbcScalarType::Bool, 1 };
-    bound.id = texture.specId;
-    
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
-
     emitRegisterStore(ins.dst[0], result);
   }
   
@@ -4121,15 +3944,9 @@ namespace dxvk {
       m_module.opSelectionMerge(cond.labelEnd, spv::SelectionControlMaskNone);
       m_module.opBranchConditional(zeroTest.id, cond.labelIf, cond.labelEnd);
       
+      // OpKill terminates the block
       m_module.opLabel(cond.labelIf);
-
-      if (m_moduleInfo.options.useDemoteToHelperInvocation) {
-        m_module.opDemoteToHelperInvocation();
-        m_module.opBranch(cond.labelEnd);
-      } else {
-        // OpKill terminates the block
-        m_module.opKill();
-      }
+      m_module.opKill();
       
       m_module.opLabel(cond.labelEnd);
     } else {
@@ -4145,33 +3962,15 @@ namespace dxvk {
           m_module.constu32(spv::ScopeSubgroup),
           killState);
         
-        uint32_t laneId = m_module.opLoad(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          m_ps.builtinLaneId);
+        uint32_t invocationMask = m_module.opLoad(
+          getVectorTypeId({ DxbcScalarType::Uint32, 4 }),
+          m_ps.invocationMask);
         
-        uint32_t laneIdPart = m_module.opShiftRightLogical(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          laneId, m_module.constu32(5));
-        
-        uint32_t laneMask = m_module.opVectorExtractDynamic(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          ballot, laneIdPart);
-        
-        uint32_t laneIdQuad = m_module.opBitwiseAnd(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          laneId, m_module.constu32(0x1c));
-        
-        laneMask = m_module.opShiftRightLogical(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          laneMask, laneIdQuad);
-        
-        laneMask = m_module.opBitwiseAnd(
-          getScalarTypeId(DxbcScalarType::Uint32),
-          laneMask, m_module.constu32(0xf));
-        
-        uint32_t killSubgroup = m_module.opIEqual(
+        uint32_t killSubgroup = m_module.opAll(
           m_module.defBoolType(),
-          laneMask, m_module.constu32(0xf));
+          m_module.opIEqual(
+            m_module.defVectorType(m_module.defBoolType(), 4),
+            ballot, invocationMask));
         
         DxbcConditional cond;
         cond.labelIf  = m_module.allocateId();
@@ -4189,64 +3988,6 @@ namespace dxvk {
     }
   }
   
-  
-  void DxbcCompiler::emitControlFlowLabel(const DxbcShaderInstruction& ins) {
-    uint32_t functionNr = ins.dst[0].idx[0].offset;
-    uint32_t functionId = getFunctionId(functionNr);
-    
-    this->emitFunctionBegin(
-      functionId,
-      m_module.defVoidType(),
-      m_module.defFunctionType(
-        m_module.defVoidType(), 0, nullptr));
-    
-    m_module.opLabel(m_module.allocateId());
-    m_module.setDebugName(functionId, str::format("label", functionNr).c_str());
-    
-    m_insideFunction = true;
-  }
-
-  
-  void DxbcCompiler::emitControlFlowCall(const DxbcShaderInstruction& ins) {
-    uint32_t functionNr = ins.src[0].idx[0].offset;
-    uint32_t functionId = getFunctionId(functionNr);
-
-    m_module.opFunctionCall(
-      m_module.defVoidType(),
-      functionId, 0, nullptr);
-  }
-
-  
-  void DxbcCompiler::emitControlFlowCallc(const DxbcShaderInstruction& ins) {
-    uint32_t functionNr = ins.src[1].idx[0].offset;
-    uint32_t functionId = getFunctionId(functionNr);
-
-    // Perform zero test on the first component of the condition
-    const DxbcRegisterValue condition = emitRegisterLoad(
-      ins.src[0], DxbcRegMask(true, false, false, false));
-    
-    const DxbcRegisterValue zeroTest = emitRegisterZeroTest(
-      condition, ins.controls.zeroTest());
-    
-    // We basically have to wrap this into an 'if' block
-    const uint32_t callLabel = m_module.allocateId();
-    const uint32_t skipLabel = m_module.allocateId();
-    
-    m_module.opSelectionMerge(skipLabel,
-      spv::SelectionControlMaskNone);
-    
-    m_module.opBranchConditional(
-      zeroTest.id, callLabel, skipLabel);
-    
-    m_module.opLabel(callLabel);
-    m_module.opFunctionCall(
-      m_module.defVoidType(),
-      functionId, 0, nullptr);
-
-    m_module.opBranch(skipLabel);
-    m_module.opLabel(skipLabel);
-  }
-
   
   void DxbcCompiler::emitControlFlow(const DxbcShaderInstruction& ins) {
     switch (ins.op) {
@@ -4284,7 +4025,7 @@ namespace dxvk {
       case DxbcOpcode::Breakc:
       case DxbcOpcode::Continuec:
         return this->emitControlFlowBreakc(ins);
-
+        
       case DxbcOpcode::Ret:
         return this->emitControlFlowRet(ins);
 
@@ -4294,15 +4035,6 @@ namespace dxvk {
       case DxbcOpcode::Discard:
         return this->emitControlFlowDiscard(ins);
       
-      case DxbcOpcode::Label:
-        return this->emitControlFlowLabel(ins);
-
-      case DxbcOpcode::Call:
-        return this->emitControlFlowCall(ins);
-
-      case DxbcOpcode::Callc:
-        return this->emitControlFlowCallc(ins);
-
       default:
         Logger::warn(str::format(
           "DxbcCompiler: Unhandled instruction: ",
@@ -4412,42 +4144,6 @@ namespace dxvk {
   }
   
   
-  DxbcRegisterValue DxbcCompiler::emitBuildVector(
-          DxbcRegisterValue       scalar,
-          uint32_t                count) {
-    if (count == 1)
-      return scalar;
-
-    std::array<uint32_t, 4> scalarIds =
-      { scalar.id, scalar.id, scalar.id, scalar.id };
-
-    DxbcRegisterValue result;
-    result.type.ctype = scalar.type.ctype;
-    result.type.ccount = count;
-    result.id = m_module.constComposite(
-      getVectorTypeId(result.type),
-      count, scalarIds.data());
-    return result;
-  }
-
-
-  DxbcRegisterValue DxbcCompiler::emitBuildZeroVector(
-          DxbcVectorType          type) {
-    DxbcRegisterValue result;
-    result.type.ctype = type.ctype;
-    result.type.ccount = 1;
-
-    switch (type.ctype) {
-      case DxbcScalarType::Float32: result.id = m_module.constf32(0.0f); break;
-      case DxbcScalarType::Uint32:  result.id = m_module.constu32(0u); break;
-      case DxbcScalarType::Sint32:  result.id = m_module.consti32(0); break;
-      default: throw DxvkError("DxbcCompiler: Invalid scalar type");
-    }
-
-    return emitBuildVector(result, type.ccount);
-  }
-
-
   DxbcRegisterValue DxbcCompiler::emitRegisterBitcast(
           DxbcRegisterValue       srcValue,
           DxbcScalarType          dstType) {
@@ -4611,9 +4307,7 @@ namespace dxvk {
     
     switch (value.type.ctype) {
       case DxbcScalarType::Float32: value.id = m_module.opFAbs(typeId, value.id); break;
-      case DxbcScalarType::Float64: value.id = m_module.opFAbs(typeId, value.id); break;
       case DxbcScalarType::Sint32:  value.id = m_module.opSAbs(typeId, value.id); break;
-      case DxbcScalarType::Sint64:  value.id = m_module.opSAbs(typeId, value.id); break;
       default: Logger::warn("DxbcCompiler: Cannot get absolute value for given type");
     }
     
@@ -4686,22 +4380,15 @@ namespace dxvk {
           DxbcOpModifiers         modifiers) {
     const uint32_t typeId = getVectorTypeId(value.type);
     
-    if (modifiers.saturate) {
-      DxbcRegMask mask;
-      DxbcRegisterValue vec0, vec1;
-
-      if (value.type.ctype == DxbcScalarType::Float32) {
-        mask = DxbcRegMask::firstN(value.type.ccount);
-        vec0 = emitBuildConstVecf32(0.0f, 0.0f, 0.0f, 0.0f, mask);
-        vec1 = emitBuildConstVecf32(1.0f, 1.0f, 1.0f, 1.0f, mask);
-      } else if (value.type.ctype == DxbcScalarType::Float64) {
-        mask = DxbcRegMask::firstN(value.type.ccount * 2);
-        vec0 = emitBuildConstVecf64(0.0, 0.0, mask);
-        vec1 = emitBuildConstVecf64(1.0, 1.0, mask);
-      }
-
-      if (mask)
+    if (value.type.ctype == DxbcScalarType::Float32) {
+      // Saturating only makes sense on floats
+      if (modifiers.saturate) {
+        const DxbcRegMask       mask = DxbcRegMask::firstN(value.type.ccount);
+        const DxbcRegisterValue vec0 = emitBuildConstVecf32(0.0f, 0.0f, 0.0f, 0.0f, mask);
+        const DxbcRegisterValue vec1 = emitBuildConstVecf32(1.0f, 1.0f, 1.0f, 1.0f, mask);
+        
         value.id = m_module.opNClamp(typeId, value.id, vec0.id, vec1.id);
+      }
     }
     
     return value;
@@ -4741,36 +4428,38 @@ namespace dxvk {
     const DxbcRegister&           operand) {
     // r# regs are indexed as follows:
     //    (0) register index (immediate)
-    uint32_t regIdx = operand.idx[0].offset;
-
-    if (regIdx >= m_rRegs.size())
-      m_rRegs.resize(regIdx + 1, 0u);
-
-    if (!m_rRegs.at(regIdx)) {
-      DxbcRegisterInfo info;
-      info.type.ctype   = DxbcScalarType::Float32;
-      info.type.ccount  = 4;
-      info.type.alength = 0;
-      info.sclass       = spv::StorageClassPrivate;
-
-      uint32_t varId = emitNewVariable(info);
-      m_rRegs.at(regIdx) = varId;
-
-      m_module.setDebugName(varId,
-        str::format("r", regIdx).c_str());
-    }
-
     DxbcRegisterPointer result;
     result.type.ctype  = DxbcScalarType::Float32;
     result.type.ccount = 4;
-    result.id = m_rRegs.at(regIdx);
+    result.id = m_rRegs.at(operand.idx[0].offset);
     return result;
   }
   
   
   DxbcRegisterPointer DxbcCompiler::emitGetIndexableTempPtr(
     const DxbcRegister&           operand) {
-    return getIndexableTempPtr(operand, emitIndexLoad(operand.idx[1]));
+    // x# regs are indexed as follows:
+    //    (0) register index (immediate)
+    //    (1) element index (relative)
+    const uint32_t regId = operand.idx[0].offset;
+    
+    const DxbcRegisterValue vectorId
+      = emitIndexLoad(operand.idx[1]);
+    
+    DxbcRegisterInfo info;
+    info.type.ctype   = DxbcScalarType::Float32;
+    info.type.ccount  = m_xRegs[regId].ccount;
+    info.type.alength = 0;
+    info.sclass       = spv::StorageClassPrivate;
+    
+    DxbcRegisterPointer result;
+    result.type.ctype  = info.type.ctype;
+    result.type.ccount = info.type.ccount;
+    result.id = m_module.opAccessChain(
+      getPointerTypeId(info),
+      m_xRegs.at(regId).varId,
+      1, &vectorId.id);
+    return result;
   }
   
   
@@ -4875,6 +4564,35 @@ namespace dxvk {
   }
   
   
+  DxbcRegisterPointer DxbcCompiler::emitGetConstBufPtr(
+    const DxbcRegister&           operand) {
+    // Constant buffers take a two-dimensional index:
+    //    (0) register index (immediate)
+    //    (1) constant offset (relative)
+    DxbcRegisterInfo info;
+    info.type.ctype   = DxbcScalarType::Float32;
+    info.type.ccount  = 4;
+    info.type.alength = 0;
+    info.sclass = spv::StorageClassUniform;
+    
+    const uint32_t regId = operand.idx[0].offset;
+    const DxbcRegisterValue constId = emitIndexLoad(operand.idx[1]);
+    
+    const uint32_t ptrTypeId = getPointerTypeId(info);
+    
+    const std::array<uint32_t, 2> indices =
+      {{ m_module.consti32(0), constId.id }};
+    
+    DxbcRegisterPointer result;
+    result.type.ctype  = info.type.ctype;
+    result.type.ccount = info.type.ccount;
+    result.id = m_module.opAccessChain(ptrTypeId,
+      m_constantBuffers.at(regId).varId,
+      indices.size(), indices.data());
+    return result;
+  }
+  
+  
   DxbcRegisterPointer DxbcCompiler::emitGetImmConstBufPtr(
     const DxbcRegister&           operand) {
     const DxbcRegisterValue constId
@@ -4935,6 +4653,9 @@ namespace dxvk {
       
       case DxbcOperandType::Output:
         return emitGetOutputPtr(operand);
+      
+      case DxbcOperandType::ConstantBuffer:
+        return emitGetConstBufPtr(operand);
       
       case DxbcOperandType::ImmediateConstantBuffer:
         return emitGetImmConstBufPtr(operand);
@@ -4998,11 +4719,6 @@ namespace dxvk {
           { DxbcScalarType::Float32, 1 },
           m_ps.builtinDepth };
       
-      case DxbcOperandType::OutputStencilRef:
-        return DxbcRegisterPointer {
-          { DxbcScalarType::Sint32, 1 },
-          m_ps.builtinStencilRef };
-
       case DxbcOperandType::InputPrimitiveId:
         return DxbcRegisterPointer {
           { DxbcScalarType::Uint32, 1 },
@@ -5047,7 +4763,7 @@ namespace dxvk {
     // For UAVs and shared memory, different methods
     // of obtaining the final pointer are used.
     bool isTgsm = operand.type == DxbcOperandType::ThreadGroupSharedMemory;
-    bool isSsbo = m_moduleInfo.options.minSsboAlignment <= resourceInfo.align
+    bool isSsbo = m_moduleInfo.options.useRawSsbo
                && resourceInfo.type != DxbcResourceType::Typed
                && !isTgsm;
     
@@ -5112,8 +4828,7 @@ namespace dxvk {
     // Shared memory is the only type of buffer that
     // is not accessed through a texel buffer view
     bool isTgsm = operand.type == DxbcOperandType::ThreadGroupSharedMemory;
-    bool isSsbo = m_moduleInfo.options.minSsboAlignment <= bufferInfo.align
-               && !isTgsm;
+    bool isSsbo = m_moduleInfo.options.useRawSsbo && !isTgsm;
     
     // Common types and IDs used while loading the data
     uint32_t bufferId = isTgsm || isSsbo ? 0 : m_module.opLoad(bufferInfo.typeId, bufferInfo.varId);
@@ -5199,8 +4914,7 @@ namespace dxvk {
     
     // Thread Group Shared Memory is not accessed through a texel buffer view
     bool isTgsm = operand.type == DxbcOperandType::ThreadGroupSharedMemory;
-    bool isSsbo = m_moduleInfo.options.minSsboAlignment <= bufferInfo.align
-               && !isTgsm;
+    bool isSsbo = m_moduleInfo.options.useRawSsbo && !isTgsm;
     
     // Perform UAV writes only if the UAV is bound and if there
     // is nothing else preventing us from writing to it.
@@ -5269,15 +4983,6 @@ namespace dxvk {
         srcComponentIndex += 1;
       }
     }
-
-    // Make sure that shared memory stores are made visible in
-    // case the game does not synchronize invocations properly
-    if (isTgsm && m_moduleInfo.options.forceTgsmBarriers) {
-      m_module.opMemoryBarrier(
-        m_module.constu32(spv::ScopeWorkgroup),
-        m_module.constu32(spv::MemorySemanticsWorkgroupMemoryMask
-                        | spv::MemorySemanticsAcquireReleaseMask));
-    }
     
     // End conditional block
     if (!isTgsm) {
@@ -5297,10 +5002,6 @@ namespace dxvk {
     result.id = m_module.opArrayLength(
       getVectorTypeId(result.type),
       bufferInfo.varId, 0);
-
-    // Report a size of 0 if resource is not bound
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      bufferInfo.specId, result.id, m_module.constu32(0));
     return result;
   }
   
@@ -5320,10 +5021,6 @@ namespace dxvk {
     result.type.ccount = 1;
     result.id = m_module.opImageQuerySize(
       getVectorTypeId(result.type), bufferId);
-
-    // Report a size of 0 if resource is not bound
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      bufferInfo.specId, result.id, m_module.constu32(0));
     return result;
   }
   
@@ -5344,10 +5041,6 @@ namespace dxvk {
       // Report one LOD in case of UAVs
       result.id = m_module.constu32(1);
     }
-
-    // Report zero LODs for unbound images
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      info.specId, result.id, m_module.constu32(0));
     return result;
   }
   
@@ -5357,37 +5050,16 @@ namespace dxvk {
     if (resource.type == DxbcOperandType::Rasterizer) {
       // SPIR-V has no gl_NumSamples equivalent, so we have
       // to work around it using a specialization constant
-      if (!m_ps.specRsSampleCount) {
-        m_ps.specRsSampleCount = emitNewSpecConstant(
-          DxvkSpecConstantId::RasterizerSampleCount,
-          DxbcScalarType::Uint32, 1,
-          "RasterizerSampleCount");
-      }
-
-      DxbcRegisterValue result;
-      result.type.ctype  = DxbcScalarType::Uint32;
-      result.type.ccount = 1;
-      result.id = m_ps.specRsSampleCount;
-      return result;
+      return getSpecConstant(DxvkSpecConstantId::RasterizerSampleCount);
     } else {
       DxbcBufferInfo info = getBufferInfo(resource);
       
       DxbcRegisterValue result;
       result.type.ctype  = DxbcScalarType::Uint32;
       result.type.ccount = 1;
-
-      if (info.image.ms) {
-        result.id = m_module.opImageQuerySamples(
-          getVectorTypeId(result.type),
-          m_module.opLoad(info.typeId, info.varId));
-      } else {
-        // OpImageQuerySamples requires MSAA images
-        result.id = m_module.constu32(1);
-      }
-      
-      // Report a sample count of 0 for unbound images
-      result.id = m_module.opSelect(getVectorTypeId(result.type),
-        info.specId, result.id, m_module.constu32(0));
+      result.id = m_module.opImageQuerySamples(
+        getVectorTypeId(result.type),
+        m_module.opLoad(info.typeId, info.varId));
       return result;
     }
   }
@@ -5412,27 +5084,7 @@ namespace dxvk {
         getVectorTypeId(result.type),
         m_module.opLoad(info.typeId, info.varId));
     }
-
-    // Report a size of zero for unbound textures
-    uint32_t zero = m_module.constu32(0);
-    uint32_t cond = info.specId;
-
-    if (result.type.ccount > 1) {
-      std::array<uint32_t, 4> zeroes = {{ zero, zero, zero, zero }};
-      std::array<uint32_t, 4> conds  = {{ cond, cond, cond, cond }};
-
-      zero = m_module.opCompositeConstruct(
-        getVectorTypeId(result.type),
-        result.type.ccount, zeroes.data());
-      
-      cond = m_module.opCompositeConstruct(
-        m_module.defVectorType(m_module.defBoolType(), result.type.ccount),
-        result.type.ccount, conds.data());
-    }
-
-    result.id = m_module.opSelect(
-      getVectorTypeId(result.type),
-      cond, result.id, zero);
+    
     return result;
   }
   
@@ -5447,13 +5099,9 @@ namespace dxvk {
     
     const uint32_t typeId = getVectorTypeId(result.type);
     
-    uint32_t offset = m_moduleInfo.options.useSdivForBufferIndex
-      ? m_module.opSDiv             (typeId, structOffset.id, m_module.consti32(4))
-      : m_module.opShiftRightLogical(typeId, structOffset.id, m_module.consti32(2));
-    
     result.id = m_module.opIAdd(typeId,
       m_module.opIMul(typeId, structId.id, m_module.consti32(structStride / 4)),
-      offset);
+      m_module.opSDiv(typeId, structOffset.id, m_module.consti32(4)));
     return result;
   }
   
@@ -5463,12 +5111,10 @@ namespace dxvk {
     DxbcRegisterValue result;
     result.type.ctype  = DxbcScalarType::Sint32;
     result.type.ccount = 1;
-    
-    uint32_t typeId = getVectorTypeId(result.type);
-    
-    result.id = m_moduleInfo.options.useSdivForBufferIndex
-      ? m_module.opSDiv             (typeId, byteOffset.id, m_module.consti32(4))
-      : m_module.opShiftRightLogical(typeId, byteOffset.id, m_module.consti32(2));
+    result.id = m_module.opSDiv(
+      getVectorTypeId(result.type),
+      byteOffset.id,
+      m_module.consti32(4));
     return result;
   }
   
@@ -5566,31 +5212,8 @@ namespace dxvk {
   DxbcRegisterValue DxbcCompiler::emitConstantBufferLoad(
     const DxbcRegister&           reg,
           DxbcRegMask             writeMask) {
-    // Constant buffers take a two-dimensional index:
-    //    (0) register index (immediate)
-    //    (1) constant offset (relative)
-    DxbcRegisterInfo info;
-    info.type.ctype   = DxbcScalarType::Float32;
-    info.type.ccount  = 4;
-    info.type.alength = 0;
-    info.sclass = spv::StorageClassUniform;
-    
-    uint32_t regId = reg.idx[0].offset;
-    DxbcRegisterValue constId = emitIndexLoad(reg.idx[1]);
-    
-    uint32_t ptrTypeId = getPointerTypeId(info);
-    
-    const std::array<uint32_t, 2> indices =
-      {{ m_module.consti32(0), constId.id }};
-    
-    DxbcRegisterPointer ptr;
-    ptr.type.ctype  = info.type.ctype;
-    ptr.type.ccount = info.type.ccount;
-    ptr.id = m_module.opAccessChain(ptrTypeId,
-      m_constantBuffers.at(regId).varId,
-      indices.size(), indices.data());
+    DxbcRegisterPointer ptr = emitGetOperandPtr(reg);
 
-    // Load individual components from buffer
     std::array<uint32_t, 4> ccomps = { 0, 0, 0, 0 };
     std::array<uint32_t, 4> scomps = { 0, 0, 0, 0 };
     uint32_t                scount = 0;
@@ -5605,7 +5228,7 @@ namespace dxvk {
       uint32_t componentPtr = m_module.opAccessChain(
         m_module.defPointerType(
           getScalarTypeId(DxbcScalarType::Float32),
-          spv::StorageClassUniform),
+          spv::StorageClassUniform), //Constant),
         ptr.id, 1, &componentId);
       
       ccomps[sindex] = m_module.opLoad(
@@ -5631,7 +5254,6 @@ namespace dxvk {
         scount, scomps.data());
     }
 
-    // Apply any post-processing that might be necessary
     result = emitRegisterBitcast(result, reg.dataType);
     result = emitSrcOperandModifiers(result, reg.modifiers);
     return result;
@@ -5650,8 +5272,6 @@ namespace dxvk {
         result.type.ctype  = DxbcScalarType::Uint32;
         result.type.ccount = 1;
         result.id = m_module.constu32(reg.imm.u32_1);
-
-        result = emitRegisterExtend(result, writeMask.popCount());
       } else if (reg.componentCount == DxbcComponentCount::Component4) {
         // Create a u32 vector with as many components as needed
         std::array<uint32_t, 4> indices = { };
@@ -5704,47 +5324,48 @@ namespace dxvk {
   void DxbcCompiler::emitRegisterStore(
     const DxbcRegister&           reg,
           DxbcRegisterValue       value) {
-    if (reg.type == DxbcOperandType::IndexableTemp) {
-      DxbcRegisterValue vectorId = emitIndexLoad(reg.idx[1]);
-      uint32_t boundsCheck = m_module.opULessThan(
-        m_module.defBoolType(), vectorId.id,
-        m_module.constu32(m_xRegs.at(reg.idx[0].offset).alength));
-      
-      DxbcConditional cond;
-      cond.labelIf  = m_module.allocateId();
-      cond.labelEnd = m_module.allocateId();
-      
-      m_module.opSelectionMerge(cond.labelEnd, spv::SelectionControlMaskNone);
-      m_module.opBranchConditional(boundsCheck, cond.labelIf, cond.labelEnd);
-      
-      m_module.opLabel(cond.labelIf);
-      emitValueStore(getIndexableTempPtr(reg, vectorId), value, reg.mask);
-      
-      m_module.opBranch(cond.labelEnd);
-      m_module.opLabel (cond.labelEnd);
-    } else {
-      emitValueStore(emitGetOperandPtr(reg), value, reg.mask);
-    }
+    emitValueStore(emitGetOperandPtr(reg), value, reg.mask);
   }
   
   
-  uint32_t DxbcCompiler::emitNewSpecConstant(
-          DxvkSpecConstantId      specId,
-          DxbcScalarType          type,
-          uint32_t                value,
-    const char*                   name) {
-    uint32_t id = m_module.specConst32(
-      getScalarTypeId(type), value);
+  DxbcRegisterValue DxbcCompiler::getSpecConstant(DxvkSpecConstantId specId) {
+    const uint32_t specIdOffset = uint32_t(specId) - uint32_t(DxvkSpecConstantId::SpecConstantIdMin);
     
-    m_module.decorateSpecId(id, uint32_t(specId));
-    m_module.setDebugName(id, name);
-    return id;
+    // Look up spec constant in the array
+    DxbcRegisterValue value = m_specConstants.at(specIdOffset);
+    
+    if (value.id != 0)
+      return value;
+    
+    // Declare a new specialization constant if needed
+    DxbcSpecConstant info = getSpecConstantProperties(specId);
+    
+    value.type.ctype  = info.ctype;
+    value.type.ccount = info.ccount;
+    value.id = m_module.specConst32(
+      getVectorTypeId(value.type),
+      info.value);
+    
+    m_module.decorateSpecId(value.id, uint32_t(specId));
+    m_module.setDebugName(value.id, info.name);
+    
+    m_specConstants.at(specIdOffset) = value;
+    return value;
+  }
+  
+  
+  DxbcSpecConstant DxbcCompiler::getSpecConstantProperties(DxvkSpecConstantId specId) {
+    static const std::array<DxbcSpecConstant,
+      uint32_t(DxvkSpecConstantId::SpecConstantIdMax) -
+      uint32_t(DxvkSpecConstantId::SpecConstantIdMin) + 1> s_specConstants = {{
+        { DxbcScalarType::Uint32,   1,   1, "RasterizerSampleCount" },
+    }};
+    
+    return s_specConstants.at(uint32_t(specId) - uint32_t(DxvkSpecConstantId::SpecConstantIdMin));
   }
   
   
   void DxbcCompiler::emitInputSetup() {
-    m_module.setLateConst(m_vArrayLengthId, &m_vArrayLength);
-
     // Copy all defined v# registers into the input array
     const uint32_t vecTypeId = m_module.defVectorType(m_module.defFloatType(32), 4);
     const uint32_t ptrTypeId = m_module.defPointerType(vecTypeId, spv::StorageClassPrivate);
@@ -5790,8 +5411,6 @@ namespace dxvk {
   
   
   void DxbcCompiler::emitInputSetup(uint32_t vertexCount) {
-    m_module.setLateConst(m_vArrayLengthId, &m_vArrayLength);
-
     // Copy all defined v# registers into the input array. Note
     // that the outer index of the array is the vertex index.
     const uint32_t vecTypeId    = m_module.defVectorType(m_module.defFloatType(32), 4);
@@ -5896,32 +5515,22 @@ namespace dxvk {
       uint32_t specTypeId = getScalarTypeId(DxbcScalarType::Uint32);
       uint32_t compTypeId = getScalarTypeId(vector.type.ctype);
       
-      uint32_t specId = m_module.specConst32(specTypeId, 0x3210);
-      m_module.decorateSpecId(specId, uint32_t(DxvkSpecConstantId::ColorComponentMappings) + i);
-      m_module.setDebugName(specId, str::format("omap", i).c_str());
-
       std::array<uint32_t, 4> scalars;
+
       for (uint32_t c = 0; c < vector.type.ccount; c++) {
-        scalars[c] = m_module.opVectorExtractDynamic(compTypeId, vector.id,
-          m_module.opBitFieldUExtract(specTypeId, specId,
-            m_module.constu32(4 * c), m_module.constu32(4)));
+        const char* components = "rgba";
+
+        uint32_t specId = m_module.specConst32(specTypeId, c);
+        m_module.decorateSpecId(specId, uint32_t(DxvkSpecConstantId::ColorComponentMappings) + 4 * i + c);
+        m_module.setDebugName(specId, str::format("omap", i, ".", components[c]).c_str());
+
+        scalars[c] = m_module.opVectorExtractDynamic(compTypeId, vector.id, specId);
       }
 
-      uint32_t typeId = getVectorTypeId(vector.type);
-      vector.id = m_module.opCompositeConstruct(typeId, vector.type.ccount, scalars.data());
-
-      // Replace NaN by zero if requested
-      if (m_moduleInfo.options.enableRtOutputNanFixup && vector.type.ctype == DxbcScalarType::Float32) {
-        uint32_t boolType = m_module.defBoolType();
-
-        if (vector.type.ccount > 1)
-          boolType = m_module.defVectorType(boolType, vector.type.ccount);
-
-        uint32_t zero = emitBuildConstVecf32(0.0f, 0.0f, 0.0f, 0.0f,
-          DxbcRegMask((1u << vector.type.ccount) - 1)).id;
-        uint32_t isNan = m_module.opIsNan(boolType, vector.id);
-        vector.id = m_module.opSelect(typeId, isNan, zero, vector.id);
-      }
+      vector.id = m_module.opCompositeConstruct(
+        getVectorTypeId(vector.type),
+        vector.type.ccount,
+        scalars.data());
       
       emitValueStore(m_oRegs[i], vector,
         DxbcRegMask::firstN(vector.type.ccount));
@@ -6374,8 +5983,8 @@ namespace dxvk {
         { m_hs.builtinTessLevelOuter, 1 },  // FinalTriVeq0EdgeTessFactor
         { m_hs.builtinTessLevelOuter, 2 },  // FinalTriWeq0EdgeTessFactor
         { m_hs.builtinTessLevelInner, 0 },  // FinalTriInsideTessFactor
-        { m_hs.builtinTessLevelOuter, 0 },  // FinalLineDensityTessFactor
-        { m_hs.builtinTessLevelOuter, 1 },  // FinalLineDetailTessFactor
+        { m_hs.builtinTessLevelOuter, 0 },  // FinalLineDetailTessFactor
+        { m_hs.builtinTessLevelOuter, 1 },  // FinalLineDensityTessFactor
       }};
       
       const TessFactor tessFactor = s_tessFactors.at(uint32_t(sv)
@@ -6652,9 +6261,11 @@ namespace dxvk {
   
   
   void DxbcCompiler::emitVsInit() {
-    m_module.enableCapability(spv::CapabilityClipDistance);
-    m_module.enableCapability(spv::CapabilityCullDistance);
+    //m_module.enableCapability(spv::CapabilityClipDistance);
+    //m_module.enableCapability(spv::CapabilityCullDistance);
     m_module.enableCapability(spv::CapabilityDrawParameters);
+    
+    m_module.enableExtension("SPV_KHR_shader_draw_parameters");
     
     // Declare the per-vertex output block. This is where
     // the vertex shader will write the vertex position.
@@ -6769,16 +6380,14 @@ namespace dxvk {
     // Declare the per-vertex output block. Outputs are not
     // declared as arrays, instead they will be flushed when
     // calling EmitVertex.
-    if (!m_moduleInfo.xfb || m_moduleInfo.xfb->rasterizedStream >= 0) {
-      const uint32_t perVertexStruct = this->getPerVertexBlockId();
-      const uint32_t perVertexPointer = m_module.defPointerType(
-        perVertexStruct, spv::StorageClassOutput);
-      
-      m_perVertexOut = m_module.newVar(
-        perVertexPointer, spv::StorageClassOutput);
-      m_entryPointInterfaces.push_back(m_perVertexOut);
-      m_module.setDebugName(m_perVertexOut, "gs_vertex_out");
-    }
+    const uint32_t perVertexStruct = this->getPerVertexBlockId();
+    const uint32_t perVertexPointer = m_module.defPointerType(
+      perVertexStruct, spv::StorageClassOutput);
+    
+    m_perVertexOut = m_module.newVar(
+      perVertexPointer, spv::StorageClassOutput);
+    m_entryPointInterfaces.push_back(m_perVertexOut);
+    m_module.setDebugName(m_perVertexOut, "gs_vertex_out");
     
     // Cull/clip distances as outputs
     m_clipDistances = emitDclClipCullDistanceArray(
@@ -6839,13 +6448,9 @@ namespace dxvk {
         m_module.defVoidType(), 0, nullptr));
     this->emitFunctionLabel();
 
-    if (m_analysis->usesKill && m_moduleInfo.options.useDemoteToHelperInvocation) {
-      // This extension basically implements D3D-style discard
-      m_module.enableExtension("SPV_EXT_demote_to_helper_invocation");
-      m_module.enableCapability(spv::CapabilityDemoteToHelperInvocationEXT);
-    } else if (m_analysis->usesKill && m_analysis->usesDerivatives) {
-      // We may have to defer kill operations to the end of
-      // the shader in order to keep derivatives correct.
+    // We may have to defer kill operations to the end of
+    // the shader in order to keep derivatives correct.
+    if (m_analysis->usesKill && m_analysis->usesDerivatives) {
       m_ps.killState = m_module.newVarInit(
         m_module.defPointerType(m_module.defBoolType(), spv::StorageClassPrivate),
         spv::StorageClassPrivate, m_module.constBool(false));
@@ -6856,13 +6461,18 @@ namespace dxvk {
         m_module.enableCapability(spv::CapabilityGroupNonUniform);
         m_module.enableCapability(spv::CapabilityGroupNonUniformBallot);
 
-        DxbcRegisterInfo laneId;
-        laneId.type = { DxbcScalarType::Uint32, 1, 0 };
-        laneId.sclass = spv::StorageClassInput;
+        DxbcRegisterInfo invocationMask;
+        invocationMask.type = { DxbcScalarType::Uint32, 4, 0 };
+        invocationMask.sclass = spv::StorageClassFunction;
 
-        m_ps.builtinLaneId = emitNewBuiltinVariable(
-          laneId, spv::BuiltInSubgroupLocalInvocationId,
-          "fLaneId");
+        m_ps.invocationMask = emitNewVariable(invocationMask);
+        m_module.setDebugName(m_ps.invocationMask, "fInvocationMask");
+        
+        m_module.opStore(m_ps.invocationMask,
+          m_module.opGroupNonUniformBallot(
+            getVectorTypeId({ DxbcScalarType::Uint32, 4 }),
+            m_module.constu32(spv::ScopeSubgroup),
+            m_module.constBool(true)));
       }
     }
   }
@@ -6934,9 +6544,6 @@ namespace dxvk {
   
   
   void DxbcCompiler::emitGsFinalize() {
-    if (!m_gs.invocationCount)
-      m_module.setInvocations(m_entryPointId, 1);
-
     this->emitMainFunctionBegin();
     this->emitInputSetup(
       primitiveVertexCount(m_gs.inputPrimitive));
@@ -6977,10 +6584,7 @@ namespace dxvk {
     
     this->emitOutputSetup();
     this->emitOutputMapping();
-
-    if (m_moduleInfo.options.useDepthClipWorkaround)
-      this->emitOutputDepthClamp();
-    
+    this->emitOutputDepthClamp();
     this->emitFunctionEnd();
   }
   
@@ -7103,18 +6707,18 @@ namespace dxvk {
   
   
   void DxbcCompiler::emitDclInputArray(uint32_t vertexCount) {
-    DxbcVectorType info;
+    DxbcArrayType info;
     info.ctype   = DxbcScalarType::Float32;
     info.ccount  = 4;
+    info.alength = m_isgn != nullptr ? m_isgn->maxRegisterCount() : 0;
 
+    if (info.alength == 0)
+      return;
+    
     // Define the array type. This will be two-dimensional
     // in some shaders, with the outer index representing
     // the vertex ID within an invocation.
-    m_vArrayLength   = m_isgn != nullptr ? std::max(1u, m_isgn->maxRegisterCount()) : 1;
-    m_vArrayLengthId = m_module.lateConst32(getScalarTypeId(DxbcScalarType::Uint32));
-
-    uint32_t vectorTypeId = getVectorTypeId(info);
-    uint32_t arrayTypeId = m_module.defArrayType(vectorTypeId, m_vArrayLengthId);
+    uint32_t arrayTypeId = getArrayTypeId(info);
     
     if (vertexCount != 0) {
       arrayTypeId = m_module.defArrayType(
@@ -7405,47 +7009,47 @@ namespace dxvk {
   uint32_t DxbcCompiler::emitSamplePosArray() {
     const std::array<uint32_t, 32> samplePosVectors = {{
       // Invalid sample count / unbound resource
-      m_module.constvec2f32( 0.0f, 0.0f),
+      m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f),
       // VK_SAMPLE_COUNT_1_BIT
-      m_module.constvec2f32( 0.0f, 0.0f),
+      m_module.constvec4f32(0.5f, 0.5f, 0.0f, 0.0f),
       // VK_SAMPLE_COUNT_2_BIT
-      m_module.constvec2f32( 0.25f, 0.25f),
-      m_module.constvec2f32(-0.25f,-0.25f),
+      m_module.constvec4f32(0.75f, 0.75f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.25f, 0.25f, 0.0f, 0.0f),
       // VK_SAMPLE_COUNT_4_BIT
-      m_module.constvec2f32(-0.125f,-0.375f),
-      m_module.constvec2f32( 0.375f,-0.125f),
-      m_module.constvec2f32(-0.375f, 0.125f),
-      m_module.constvec2f32( 0.125f, 0.375f),
+      m_module.constvec4f32(0.375f, 0.125f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.785f, 0.375f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.125f, 0.625f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.625f, 0.875f, 0.0f, 0.0f),
       // VK_SAMPLE_COUNT_8_BIT
-      m_module.constvec2f32( 0.0625f,-0.1875f),
-      m_module.constvec2f32(-0.0625f, 0.1875f),
-      m_module.constvec2f32( 0.3125f, 0.0625f),
-      m_module.constvec2f32(-0.1875f,-0.3125f),
-      m_module.constvec2f32(-0.3125f, 0.3125f),
-      m_module.constvec2f32(-0.4375f,-0.0625f),
-      m_module.constvec2f32( 0.1875f, 0.4375f),
-      m_module.constvec2f32( 0.4375f,-0.4375f),
+      m_module.constvec4f32(0.5625f, 0.3125f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.4375f, 0.6875f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.8125f, 0.5625f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.3125f, 0.1875f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.1875f, 0.8125f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.0625f, 0.4375f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.6875f, 0.9375f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.9375f, 0.0625f, 0.0f, 0.0f),
       // VK_SAMPLE_COUNT_16_BIT
-      m_module.constvec2f32( 0.0625f, 0.0625f),
-      m_module.constvec2f32(-0.0625f,-0.1875f),
-      m_module.constvec2f32(-0.1875f, 0.1250f),
-      m_module.constvec2f32( 0.2500f,-0.0625f),
-      m_module.constvec2f32(-0.3125f,-0.1250f),
-      m_module.constvec2f32( 0.1250f, 0.3125f),
-      m_module.constvec2f32( 0.3125f, 0.1875f),
-      m_module.constvec2f32( 0.1875f,-0.3125f),
-      m_module.constvec2f32(-0.1250f, 0.3750f),
-      m_module.constvec2f32( 0.0000f,-0.4375f),
-      m_module.constvec2f32(-0.2500f,-0.3750f),
-      m_module.constvec2f32(-0.3750f, 0.2500f),
-      m_module.constvec2f32(-0.5000f, 0.0000f),
-      m_module.constvec2f32( 0.4375f,-0.2500f),
-      m_module.constvec2f32( 0.3750f, 0.4375f),
-      m_module.constvec2f32(-0.4375f,-0.5000f),
+      m_module.constvec4f32(0.5625f, 0.5625f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.4375f, 0.3125f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.3125f, 0.6250f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.7500f, 0.4375f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.1875f, 0.3750f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.6250f, 0.8125f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.8125f, 0.6875f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.6875f, 0.1875f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.3750f, 0.8750f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.5000f, 0.0625f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.2500f, 0.1250f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.1250f, 0.7500f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.0000f, 0.5000f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.9375f, 0.2500f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.8750f, 0.9375f, 0.0f, 0.0f),
+      m_module.constvec4f32(0.0625f, 0.0000f, 0.0f, 0.0f),
     }};
     
     uint32_t arrayTypeId = getArrayTypeId({
-      DxbcScalarType::Float32, 2,
+      DxbcScalarType::Float32, 4,
       static_cast<uint32_t>(samplePosVectors.size()) });
     
     uint32_t samplePosArray = m_module.constComposite(
@@ -7461,42 +7065,7 @@ namespace dxvk {
     return varId;
   }
   
-
-  void DxbcCompiler::emitFloatControl() {
-    DxbcFloatControlFlags flags = m_moduleInfo.options.floatControl;
-
-    if (flags.isClear())
-      return;
-
-    const uint32_t width32 = 32;
-    const uint32_t width64 = 64;
-
-    m_module.enableExtension("SPV_KHR_float_controls");
-
-    if (flags.test(DxbcFloatControlFlag::DenormFlushToZero32)) {
-      m_module.enableCapability(spv::CapabilityDenormFlushToZero);
-      m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDenormFlushToZero, 1, &width32);
-    }
-
-    if (flags.test(DxbcFloatControlFlag::PreserveNan32)) {
-      m_module.enableCapability(spv::CapabilitySignedZeroInfNanPreserve);
-      m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeSignedZeroInfNanPreserve, 1, &width32);
-    }
-
-    if (m_module.hasCapability(spv::CapabilityFloat64)) {
-      if (flags.test(DxbcFloatControlFlag::DenormPreserve64)) {
-        m_module.enableCapability(spv::CapabilityDenormPreserve);
-        m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeDenormPreserve, 1, &width64);
-      }
-
-      if (flags.test(DxbcFloatControlFlag::PreserveNan64)) {
-        m_module.enableCapability(spv::CapabilitySignedZeroInfNanPreserve);
-        m_module.setExecutionMode(m_entryPointId, spv::ExecutionModeSignedZeroInfNanPreserve, 1, &width64);
-      }
-    }
-  }
-
-
+  
   uint32_t DxbcCompiler::emitNewVariable(const DxbcRegisterInfo& info) {
     const uint32_t ptrTypeId = this->getPointerTypeId(info);
     return m_module.newVar(ptrTypeId, info.sclass);
@@ -7509,14 +7078,8 @@ namespace dxvk {
     const char*             name) {
     const uint32_t varId = emitNewVariable(info);
     
-    m_module.setDebugName(varId, name);
     m_module.decorateBuiltIn(varId, builtIn);
-
-    if (m_programInfo.type() == DxbcProgramType::PixelShader
-     && info.type.ctype != DxbcScalarType::Float32
-     && info.type.ctype != DxbcScalarType::Bool
-     && info.sclass == spv::StorageClassInput)
-      m_module.decorate(varId, spv::DecorationFlat);
+    m_module.setDebugName(varId, name);
     
     m_entryPointInterfaces.push_back(varId);
     return varId;
@@ -7578,32 +7141,26 @@ namespace dxvk {
     
     switch (reg.type) {
       case DxbcOperandType::Resource: {
-        const auto& texture = m_textures.at(registerId);
-
         DxbcBufferInfo result;
-        result.image  = texture.imageInfo;
-        result.stype  = texture.sampledType;
-        result.type   = texture.type;
-        result.typeId = texture.imageTypeId;
-        result.varId  = texture.varId;
-        result.specId = texture.specId;
-        result.stride = texture.structStride;
-        result.align  = texture.structAlign;
+        result.image  = m_textures.at(registerId).imageInfo;
+        result.stype  = m_textures.at(registerId).sampledType;
+        result.type   = m_textures.at(registerId).type;
+        result.typeId = m_textures.at(registerId).imageTypeId;
+        result.varId  = m_textures.at(registerId).varId;
+        result.specId = m_textures.at(registerId).specId;
+        result.stride = m_textures.at(registerId).structStride;
         return result;
       } break;
         
       case DxbcOperandType::UnorderedAccessView: {
-        const auto& uav = m_uavs.at(registerId);
-
         DxbcBufferInfo result;
-        result.image  = uav.imageInfo;
-        result.stype  = uav.sampledType;
-        result.type   = uav.type;
-        result.typeId = uav.imageTypeId;
-        result.varId  = uav.varId;
-        result.specId = uav.specId;
-        result.stride = uav.structStride;
-        result.align  = uav.structAlign;
+        result.image  = m_uavs.at(registerId).imageInfo;
+        result.stype  = m_uavs.at(registerId).sampledType;
+        result.type   = m_uavs.at(registerId).type;
+        result.typeId = m_uavs.at(registerId).imageTypeId;
+        result.varId  = m_uavs.at(registerId).varId;
+        result.specId = m_uavs.at(registerId).specId;
+        result.stride = m_uavs.at(registerId).structStride;
         return result;
       } break;
         
@@ -7618,7 +7175,6 @@ namespace dxvk {
         result.varId  = m_gRegs.at(registerId).varId;
         result.specId = 0;
         result.stride = m_gRegs.at(registerId).elementStride;
-        result.align  = 0;
         return result;
       } break;
         
@@ -7689,10 +7245,7 @@ namespace dxvk {
       default: {
         DxbcVectorType result;
         result.ctype  = DxbcScalarType::Float32;
-        result.ccount = 4;
-
-        if (m_isgn->findByRegister(regIdx))
-          result.ccount = m_isgn->regMask(regIdx).minComponents();
+        result.ccount = m_isgn->regMask(regIdx).minComponents();
         return result;
       }
     }
@@ -7726,10 +7279,7 @@ namespace dxvk {
       default: {
         DxbcVectorType result;
         result.ctype  = DxbcScalarType::Float32;
-        result.ccount = 4;
-
-        if (m_osgn->findByRegister(regIdx))
-          result.ccount = m_osgn->regMask(regIdx).minComponents();
+        result.ccount = m_osgn->regMask(regIdx).minComponents();
         return result;
       }
     }
@@ -7739,17 +7289,15 @@ namespace dxvk {
   DxbcImageInfo DxbcCompiler::getResourceType(
           DxbcResourceDim   resourceType,
           bool              isUav) const {
-    uint32_t ms = m_moduleInfo.options.disableMsaa ? 0 : 1;
-
-    DxbcImageInfo typeInfo = [resourceType, isUav, ms] () -> DxbcImageInfo {
+    DxbcImageInfo typeInfo = [resourceType, isUav] () -> DxbcImageInfo {
       switch (resourceType) {
         case DxbcResourceDim::Buffer:         return { spv::DimBuffer, 0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_MAX_ENUM   };
         case DxbcResourceDim::Texture1D:      return { spv::Dim1D,     0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_1D         };
         case DxbcResourceDim::Texture1DArr:   return { spv::Dim1D,     1, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_1D_ARRAY   };
         case DxbcResourceDim::Texture2D:      return { spv::Dim2D,     0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D         };
         case DxbcResourceDim::Texture2DArr:   return { spv::Dim2D,     1, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D_ARRAY   };
-        case DxbcResourceDim::Texture2DMs:    return { spv::Dim2D,     0, ms,isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D         };
-        case DxbcResourceDim::Texture2DMsArr: return { spv::Dim2D,     1, ms,isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D_ARRAY   };
+        case DxbcResourceDim::Texture2DMs:    return { spv::Dim2D,     0, 1, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D         };
+        case DxbcResourceDim::Texture2DMsArr: return { spv::Dim2D,     1, 1, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_2D_ARRAY   };
         case DxbcResourceDim::Texture3D:      return { spv::Dim3D,     0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_3D         };
         case DxbcResourceDim::TextureCube:    return { spv::DimCube,   0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_CUBE       };
         case DxbcResourceDim::TextureCubeArr: return { spv::DimCube,   1, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY };
@@ -7777,30 +7325,6 @@ namespace dxvk {
         || type == DxbcScalarType::Float64;
   }
 
-  DxbcRegisterPointer DxbcCompiler::getIndexableTempPtr(
-    const DxbcRegister&           operand,
-          DxbcRegisterValue       vectorId) {
-    // x# regs are indexed as follows:
-    //    (0) register index (immediate)
-    //    (1) element index (relative)
-    const uint32_t regId = operand.idx[0].offset;
-    
-    DxbcRegisterInfo info;
-    info.type.ctype   = DxbcScalarType::Float32;
-    info.type.ccount  = m_xRegs[regId].ccount;
-    info.type.alength = 0;
-    info.sclass       = spv::StorageClassPrivate;
-    
-    DxbcRegisterPointer result;
-    result.type.ctype  = info.type.ctype;
-    result.type.ccount = info.type.ccount;
-    result.id = m_module.opAccessChain(
-      getPointerTypeId(info),
-      m_xRegs.at(regId).varId,
-      1, &vectorId.id);
-
-    return result;
-  }
 
   uint32_t DxbcCompiler::getScalarTypeId(DxbcScalarType type) {
     if (type == DxbcScalarType::Float64)
@@ -7882,18 +7406,6 @@ namespace dxvk {
   }
   
   
-  uint32_t DxbcCompiler::getFunctionId(
-          uint32_t          functionNr) {
-    auto entry = m_subroutines.find(functionNr);
-    if (entry != m_subroutines.end())
-      return entry->second;
-    
-    uint32_t functionId = m_module.allocateId();
-    m_subroutines.insert({ functionNr, functionId });
-    return functionId;
-  }
-
-
   DxbcCompilerHsForkJoinPhase* DxbcCompiler::getCurrentHsForkJoinPhase() {
     switch (m_hs.currPhaseType) {
       case DxbcCompilerHsPhase::Fork: return &m_hs.forkPhases.at(m_hs.currPhaseId);

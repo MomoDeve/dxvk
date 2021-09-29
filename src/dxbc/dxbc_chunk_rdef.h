@@ -6,6 +6,7 @@
 #include "dxbc_decoder.h"
 #include "dxbc_enums.h"
 #include "dxbc_reader.h"
+#include "dxbc_util.h"
 
 namespace dxvk {
 
@@ -18,19 +19,19 @@ namespace dxvk {
         uint32_t columnCount;
         uint32_t elementCount;
         uint32_t memberCount;
-        DxbcRdefShaderVariable* members;
+        DxbcRdefShaderVariable* members = nullptr;
     };
 
     struct DxbcRdefShaderVariable {
         std::string name;
+        DxbcRdefShaderVariableType type;
+        DxbcShaderVariableFlag flags;
         uint32_t byteOffset;
         uint32_t byteSize;
-        DxbcShaderVariableFlag flags;
-        DxbcRdefShaderVariableType type;
-        int32_t startTexture;
-        int32_t textureSize;
-        int32_t startSampler;
-        int32_t samplerSize;
+        int32_t startTexture = -1;
+        int32_t textureSize = 0;
+        int32_t startSampler = -1;
+        int32_t samplerSize = 0;
     };
 
     struct DxbcRdefConstantBuffer {
@@ -59,10 +60,13 @@ namespace dxvk {
         DxbcRdef(DxbcReader reader, DxbcTag tag);
         ~DxbcRdef();
 
+        const DxbcRdefResourceBinding& getResourceBinding(uint32_t binding, DxbcBindingType type);
+
     private:
         DxbcRdefShaderVariable readVariable(const DxbcReader& reader, DxbcReader& variableReader);
         void destroyVariable(DxbcRdefShaderVariable& variable);
         DxbcProgramType toDxbcProgramType(uint16_t type);
+        bool compareShaderInputTypeToBindingType(DxbcShaderInputType inputType, DxbcBindingType bindingType);
 
         std::string m_creator;
         uint32_t m_majorVersion = 0;

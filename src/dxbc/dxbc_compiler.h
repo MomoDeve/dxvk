@@ -7,6 +7,7 @@
 
 #include "dxbc_analysis.h"
 #include "dxbc_chunk_isgn.h"
+#include "dxbc_chunk_rdef.h"
 #include "dxbc_decoder.h"
 #include "dxbc_defs.h"
 #include "dxbc_modinfo.h"
@@ -83,9 +84,8 @@ namespace dxvk {
   
   
   struct DxbcXreg {
-    uint32_t ccount  = 0;
-    uint32_t alength = 0;
-    uint32_t varId   = 0;
+    uint32_t ccount = 0;
+    uint32_t varId  = 0;
   };
   
   
@@ -161,7 +161,6 @@ namespace dxvk {
     uint32_t builtinLayer         = 0;
     uint32_t builtinViewportId    = 0;
     uint32_t builtinInvocationId  = 0;
-    uint32_t invocationCount      = 0;
   };
   
   
@@ -173,7 +172,6 @@ namespace dxvk {
     
     uint32_t builtinFragCoord     = 0;
     uint32_t builtinDepth         = 0;
-    uint32_t builtinStencilRef    = 0;
     uint32_t builtinIsFrontFace   = 0;
     uint32_t builtinSampleId      = 0;
     uint32_t builtinSampleMaskIn  = 0;
@@ -181,10 +179,8 @@ namespace dxvk {
     uint32_t builtinLayer         = 0;
     uint32_t builtinViewportId    = 0;
     
-    uint32_t builtinLaneId        = 0;
+    uint32_t invocationMask       = 0;
     uint32_t killState            = 0;
-
-    uint32_t specRsSampleCount    = 0;
   };
   
   
@@ -350,7 +346,6 @@ namespace dxvk {
     uint32_t varId;
     uint32_t specId;
     uint32_t stride;
-    uint32_t align;
   };
   
 
@@ -381,6 +376,7 @@ namespace dxvk {
       const std::string&        fileName,
       const DxbcModuleInfo&     moduleInfo,
       const DxbcProgramInfo&    programInfo,
+      const Rc<DxbcRdef>&       rdef,
       const Rc<DxbcIsgn>&       isgn,
       const Rc<DxbcIsgn>&       osgn,
       const Rc<DxbcIsgn>&       psgn,
@@ -415,6 +411,7 @@ namespace dxvk {
     DxbcProgramInfo     m_programInfo;
     SpirvModule         m_module;
     
+    Rc<DxbcRdef>        m_rdef;
     Rc<DxbcIsgn>        m_isgn;
     Rc<DxbcIsgn>        m_osgn;
     Rc<DxbcIsgn>        m_psgn;
@@ -474,13 +471,17 @@ namespace dxvk {
     // Function state tracking. Required in order
     // to properly end functions in some cases.
     bool m_insideFunction = false;
-
+    
+    ///////////////////////////////////////////////
+    // Specialization constants. These are defined
+    // as needed by the getSpecConstant method.
+    std::array<DxbcRegisterValue,
+      uint32_t(DxvkSpecConstantId::SpecConstantIdMax) -
+      uint32_t(DxvkSpecConstantId::SpecConstantIdMin) + 1> m_specConstants;
+    
     ///////////////////////////////////////////////////////////
     // Array of input values. Since v# registers are indexable
     // in DXBC, we need to copy them into an array first.
-    uint32_t m_vArrayLength   = 0;
-    uint32_t m_vArrayLengthId = 0;
-
     uint32_t m_vArray = 0;
     
     ////////////////////////////////////////////////////
@@ -511,10 +512,6 @@ namespace dxvk {
     uint32_t m_uavCtrStructType  = 0;
     uint32_t m_uavCtrPointerType = 0;
     
-    ////////////////////////////////
-    // Function IDs for subroutines
-    std::unordered_map<uint32_t, uint32_t> m_subroutines;
-    
     ///////////////////////////////////////////////////
     // Entry point description - we'll need to declare
     // the function ID and all input/output variables.
@@ -538,11 +535,7 @@ namespace dxvk {
     /////////////////////////////
     // Enabled SPIR-V extensions
     DxbcSpirvExtensions m_extensions;
-
-    //////////////////////
-    // Global state stuff
-    bool m_precise = true;
-
+    
     /////////////////////////////////////////////////////
     // Shader interface and metadata declaration methods
     void emitDcl(
@@ -580,8 +573,7 @@ namespace dxvk {
     void emitDclConstantBufferVar(
             uint32_t                regIdx,
             uint32_t                numConstants,
-      const char*                   name,
-            bool                    asSsbo);
+      const char*                   name);
     
     void emitDclSampler(
       const DxbcShaderInstruction&  ins);
@@ -671,9 +663,6 @@ namespace dxvk {
       const DxbcShaderInstruction&  ins);
     
     void emitVectorImul(
-      const DxbcShaderInstruction&  ins);
-    
-    void emitVectorMsad(
       const DxbcShaderInstruction&  ins);
     
     void emitVectorShift(
@@ -798,15 +787,6 @@ namespace dxvk {
     void emitControlFlowDiscard(
       const DxbcShaderInstruction&  ins);
     
-    void emitControlFlowLabel(
-      const DxbcShaderInstruction&  ins);
-
-    void emitControlFlowCall(
-      const DxbcShaderInstruction&  ins);
-    
-    void emitControlFlowCallc(
-      const DxbcShaderInstruction&  ins);
-    
     void emitControlFlow(
       const DxbcShaderInstruction&  ins);
     
@@ -839,14 +819,7 @@ namespace dxvk {
             double                  xy,
             double                  zw,
       const DxbcRegMask&            writeMask);
-
-    DxbcRegisterValue emitBuildVector(
-            DxbcRegisterValue       scalar,
-            uint32_t                count);
     
-    DxbcRegisterValue emitBuildZeroVector(
-            DxbcVectorType          type);
-
     /////////////////////////////////////////
     // Generic register manipulation methods
     DxbcRegisterValue emitRegisterBitcast(
@@ -1016,12 +989,12 @@ namespace dxvk {
     
     ////////////////////////////////////////
     // Spec constant declaration and access
-    uint32_t emitNewSpecConstant(
-            DxvkSpecConstantId      specId,
-            DxbcScalarType          type,
-            uint32_t                value,
-      const char*                   name);
-
+    DxbcRegisterValue getSpecConstant(
+            DxvkSpecConstantId      specId);
+    
+    DxbcSpecConstant getSpecConstantProperties(
+            DxvkSpecConstantId      specId);
+    
     ////////////////////////////
     // Input/output preparation
     void emitInputSetup();
@@ -1177,8 +1150,6 @@ namespace dxvk {
     
     uint32_t emitSamplePosArray();
     
-    void emitFloatControl();
-    
     ///////////////////////////////
     // Variable definition methods
     uint32_t emitNewVariable(
@@ -1235,10 +1206,6 @@ namespace dxvk {
     bool isDoubleType(
             DxbcScalarType type) const;
     
-    DxbcRegisterPointer getIndexableTempPtr(
-      const DxbcRegister&           operand,
-            DxbcRegisterValue       vectorId);
-    
     ///////////////////////////
     // Type definition methods
     uint32_t getScalarTypeId(
@@ -1254,9 +1221,6 @@ namespace dxvk {
       const DxbcRegisterInfo& type);
     
     uint32_t getPerVertexBlockId();
-
-    uint32_t getFunctionId(
-            uint32_t          functionNr);
     
     DxbcCompilerHsForkJoinPhase* getCurrentHsForkJoinPhase();
     

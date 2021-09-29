@@ -60,8 +60,9 @@ namespace dxvk {
     DxbcCompiler compiler(
       fileName, moduleInfo,
       m_shexChunk->programInfo(),
-      m_isgnChunk, m_osgnChunk,
-      m_psgnChunk, analysisInfo);
+      m_rdefChunk, m_isgnChunk, 
+      m_osgnChunk, m_psgnChunk, 
+      analysisInfo);
     
     this->runCompiler(compiler, m_shexChunk->slice());
     
@@ -80,8 +81,9 @@ namespace dxvk {
     DxbcCompiler compiler(
       fileName, moduleInfo,
       DxbcProgramType::GeometryShader,
-      m_osgnChunk, m_osgnChunk,
-      m_psgnChunk, analysisInfo);
+      m_rdefChunk, m_osgnChunk, 
+      m_osgnChunk, m_psgnChunk, 
+      analysisInfo);
     
     compiler.processXfbPassthrough();
     return compiler.finalize();
